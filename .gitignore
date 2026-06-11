@@ -1,0 +1,17 @@
+# Secrets
+.env
+*.credentials
+*.credentials_rsaparams
+
+# Runner installations (large binaries + per-runner credentials)
+runners/
+
+# Downloaded runner release tarballs
+cache/
+
+# Runtime artifacts
+logs/
+state/
+
+# Claude Code local files
+.claude/

@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# runner-mgr — manage GitHub Actions self-hosted runners on this machine.
+#
+# Usage:  runner-mgr <command> [args]
+# Run    `runner-mgr help`  for details.
+
+set -euo pipefail
+
+RM_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+export RM_ROOT
+
+# shellcheck disable=SC1091
+source "$RM_ROOT/lib/common.sh"
+# shellcheck disable=SC1091
+source "$RM_ROOT/lib/github.sh"
+# shellcheck disable=SC1091
+source "$RM_ROOT/lib/runner.sh"
+# shellcheck disable=SC1091
+source "$RM_ROOT/lib/monitor.sh"
+
+require_cmd jq curl tar
+
+cmd_help() {
+  cat <<EOF
+${C_BOLD}runner-mgr${C_RESET} — GitHub Actions self-hosted runner manager
+                       ${C_DIM}repo: ${GITHUB_REPO:-(not configured)}${C_RESET}
+
+${C_BOLD}USAGE${C_RESET}
+  runner-mgr <command> [args]
+
+${C_BOLD}COMMANDS${C_RESET}
+  ${C_CYAN}setup${C_RESET}                   Interactive first-time configuration (PAT + repo)
+  ${C_CYAN}up${C_RESET} [N]                  Start N new runners (default: 1)
+  ${C_CYAN}down${C_RESET} <id|all>           Stop and unregister runner(s)
+  ${C_CYAN}stop${C_RESET} <id|all>           Stop process but keep registration
+  ${C_CYAN}start${C_RESET} <id|all>          Start a previously stopped runner
+  ${C_CYAN}restart${C_RESET} <id|all>        Stop then start
+  ${C_CYAN}status${C_RESET}                  One-shot status snapshot
+  ${C_CYAN}monitor${C_RESET} [interval]      Live dashboard (default: 2s refresh)
+  ${C_CYAN}list${C_RESET}                    List runners registered on the repo (raw)
+  ${C_CYAN}logs${C_RESET} <id> [-f]          Show runner log (-f to follow)
+  ${C_CYAN}clean${C_RESET}                   Remove offline/orphaned runners from GitHub
+  ${C_CYAN}update${C_RESET} [version]        Download new runner version into cache
+  ${C_CYAN}capacity${C_RESET}                Suggest how many runners fit current free RAM/CPU
+  ${C_CYAN}help${C_RESET}                    Show this help
+
+${C_BOLD}EXAMPLES${C_RESET}
+  runner-mgr setup                  # first-time config
+  runner-mgr up 4                   # spin up 4 runners
+  runner-mgr monitor                # live dashboard
+  runner-mgr logs 2 -f              # tail runner-2's log
+  runner-mgr down all               # tear everything down
+  runner-mgr down 3                 # remove runner-3 only
+
+${C_BOLD}WORKFLOW LABELS${C_RESET}
+  Each runner gets labels: ${C_DIM}\${RUNNER_LABELS},wsl2-<id>${C_RESET}
+  Target a specific runner in a workflow:
+    ${C_DIM}runs-on: [self-hosted, wsl2-1]${C_RESET}
+  Or any free runner:
+    ${C_DIM}runs-on: [self-hosted, wsl2]${C_RESET}
+EOF
+}
+
+cmd_setup() {
+  echo "${C_BOLD}runner-mgr setup${C_RESET}"
+  echo
+  local token repo labels
+  if [[ -f "$RM_ENV" ]]; then
+    log_warn "$RM_ENV already exists. Re-running will overwrite it."
+    read -rp "Continue? [y/N] " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { log_info "Aborted."; exit 0; }
+  fi
+
+  read -rp "GitHub Personal Access Token (scope: repo): " token
+  [[ -n "$token" ]] || die "Token required."
+
+  read -rp "Target repo (owner/name) [Boa-Thomas/Sistema-FP]: " repo
+  repo="${repo:-Boa-Thomas/Sistema-FP}"
+
+  read -rp "Extra labels (comma separated) [self-hosted,linux,x64,wsl2]: " labels
+  labels="${labels:-self-hosted,linux,x64,wsl2}"
+
+  cat > "$RM_ENV" <<EOF
+GITHUB_TOKEN=$token
+GITHUB_REPO=$repo
+RUNNER_LABELS=$labels
+RUNNER_WORKDIR=_work
+RUNNER_GROUP=default
+EOF
+  chmod 600 "$RM_ENV"
+
+  set -a; source "$RM_ENV"; set +a
+  log_info "Validating token + repo access..."
+  gh_validate_auth
+  log_ok "Setup complete. Run: runner-mgr up 4"
+}
+
+cmd_capacity() {
+  local cpus mem_free_mb
+  cpus=$(nproc)
+  mem_free_mb=$(free -m | awk '/^Mem:/ {print $7}')
+  # Reserve ~4 cores and 6 GB for host
+  local usable_cpus usable_mem
+  usable_cpus=$(( cpus - 4 )); (( usable_cpus < 1 )) && usable_cpus=1
+  usable_mem=$(( mem_free_mb - 6144 )); (( usable_mem < 1024 )) && usable_mem=1024
+
+  local heavy med light
+  heavy=$(( usable_cpus / 4 ))
+  med=$(( usable_cpus / 2 ))
+  light=$(( usable_cpus ))
+  # Cap by memory
+  local heavy_m=$(( usable_mem / 6144 ))
+  local med_m=$(( usable_mem / 3072 ))
+  local light_m=$(( usable_mem / 1024 ))
+  (( heavy_m < heavy )) && heavy=$heavy_m
+  (( med_m   < med   )) && med=$med_m
+  (( light_m < light )) && light=$light_m
+
+  printf '%sCapacity estimate%s — %d CPUs, %d MiB free RAM\n' \
+    "$C_BOLD" "$C_RESET" "$cpus" "$mem_free_mb"
+  printf '  %sHeavy jobs%s  (C++/Docker/E2E):  %s%d runners%s\n' \
+    "$C_DIM" "$C_RESET" "$C_GREEN" "$heavy" "$C_RESET"
+  printf '  %sMedium jobs%s (Node/Py/Go):      %s%d runners%s\n' \
+    "$C_DIM" "$C_RESET" "$C_GREEN" "$med" "$C_RESET"
+  printf '  %sLight jobs%s  (lint/deploy/IO):  %s%d runners%s\n' \
+    "$C_DIM" "$C_RESET" "$C_GREEN" "$light" "$C_RESET"
+  echo
+  printf '  %sRecommended starting point: %d%s\n' "$C_BOLD" "$med" "$C_RESET"
+}
+
+cmd_up() {
+  require_env
+  gh_validate_auth
+  local n="${1:-1}"
+  [[ "$n" =~ ^[0-9]+$ ]] || die "up: expected a number, got '$n'"
+  (( n > 0 )) || die "up: N must be > 0"
+
+  log_info "Provisioning $n runner(s)..."
+  local i id
+  for ((i=1; i<=n; i++)); do
+    id=$(next_runner_id)
+    provision_runner "$id"
+  done
+  echo
+  cmd_status
+}
+
+cmd_down() {
+  require_env
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "down: usage — runner-mgr down <id|all>"
+
+  if [[ "$target" == "all" ]]; then
+    local ids; ids=$(list_local_runners)
+    [[ -n "$ids" ]] || { log_info "No runners to remove."; return; }
+    for id in $ids; do remove_runner "$id"; done
+  else
+    [[ -d "$(runner_dir "$target")" ]] || die "Unknown runner id: $target"
+    remove_runner "$target"
+  fi
+}
+
+cmd_stop() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "stop: usage — runner-mgr stop <id|all>"
+  if [[ "$target" == "all" ]]; then
+    for id in $(list_local_runners); do stop_runner "$id"; done
+  else
+    stop_runner "$target"
+  fi
+}
+
+cmd_start() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "start: usage — runner-mgr start <id|all>"
+  if [[ "$target" == "all" ]]; then
+    for id in $(list_local_runners); do start_runner "$id"; done
+  else
+    start_runner "$target"
+  fi
+}
+
+cmd_restart() {
+  local target="${1:-}"
+  [[ -n "$target" ]] || die "restart: usage — runner-mgr restart <id|all>"
+  cmd_stop "$target"
+  cmd_start "$target"
+}
+
+cmd_status() {
+  render_status
+}
+
+cmd_monitor() {
+  live_monitor "${1:-2}"
+}
+
+cmd_list() {
+  require_env
+  gh_list_runners | jq -r '
+    ["ID","NAME","STATUS","BUSY","LABELS"],
+    (.[] | [
+      .id,
+      .name,
+      .status,
+      (.busy|tostring),
+      (.labels | map(.name) | join(","))
+    ]) | @tsv
+  ' | column -t -s $'\t'
+}
+
+cmd_logs() {
+  local id="${1:-}" follow="${2:-}"
+  [[ -n "$id" ]] || die "logs: usage — runner-mgr logs <id> [-f]"
+  local log; log=$(runner_log "$id")
+  [[ -f "$log" ]] || die "No log file for runner-$id"
+  if [[ "$follow" == "-f" ]]; then
+    tail -f "$log"
+  else
+    tail -n 100 "$log"
+  fi
+}
+
+cmd_clean() {
+  require_env
+  log_info "Removing offline runners from GitHub..."
+  local count=0
+  while IFS=$'\t' read -r id name status; do
+    [[ "$status" == "offline" ]] || continue
+    log_info "Deleting offline: $name (id=$id)"
+    gh_delete_runner "$id"
+    count=$((count+1))
+  done < <(gh_list_runners | jq -r '.[] | [.id, .name, .status] | @tsv')
+
+  log_info "Cleaning up local runner dirs without process or registration..."
+  for id in $(list_local_runners); do
+    if ! runner_is_running "$id"; then
+      local name; name=$(runner_state_get "$id" "name")
+      if [[ -n "$name" ]] && [[ -z "$(gh_runner_id_by_name "$name")" ]]; then
+        log_info "Removing orphan local runner-$id"
+        rm -rf "$(runner_dir "$id")"
+        rm -f "$(runner_state_file "$id")" "$(runner_pidfile "$id")"
+        count=$((count+1))
+      fi
+    fi
+  done
+  log_ok "Cleaned $count entries"
+}
+
+cmd_update() {
+  local version="${1:-}"
+  ensure_runner_tarball "$version" >/dev/null
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+
+  # Commands that don't need .env loaded yet:
+  case "$cmd" in
+    help|-h|--help) cmd_help; return ;;
+    setup)          cmd_setup "$@"; return ;;
+    capacity)       cmd_capacity "$@"; return ;;
+    logs)           cmd_logs "$@"; return ;;
+    stop|start|restart) "cmd_${cmd}" "$@"; return ;;
+  esac
+
+  # All others need config:
+  require_env
+
+  case "$cmd" in
+    up)       cmd_up "$@" ;;
+    down)     cmd_down "$@" ;;
+    status)   cmd_status "$@" ;;
+    monitor)  cmd_monitor "$@" ;;
+    list)     cmd_list "$@" ;;
+    clean)    cmd_clean "$@" ;;
+    update)   cmd_update "$@" ;;
+    *)        log_error "Unknown command: $cmd"; cmd_help; exit 1 ;;
+  esac
+}
+
+main "$@"
