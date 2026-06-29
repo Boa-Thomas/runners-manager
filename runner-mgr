@@ -99,8 +99,9 @@ RUNNER_GROUP=default
 # Adjust to your available RAM. Run 'runner-mgr capacity' for guidance.
 MAX_RUNNERS=4
 # Per-runner cgroup memory ceiling. Requires systemd as PID 1 + cgroup v2.
-# 4 runners × 2500M = 10GB, leaving ~2GB headroom on a 12GB host.
-RUNNER_MEMORY_MAX=2500M
+# Frontend vitest jobs (thread pool + --max-old-space-size=4096) create 10+
+# node processes and need ~3GB. 4 × 3500M = 14GB; mixed loads stay under 12GB.
+RUNNER_MEMORY_MAX=3500M
 EOF
   chmod 600 "$RM_ENV"
 
@@ -155,7 +156,7 @@ cmd_capacity() {
   echo
   printf '  %sSuggested .env settings:%s\n' "$C_DIM" "$C_RESET"
   printf '    MAX_RUNNERS=%d\n' "$heavy"
-  printf '    RUNNER_MEMORY_MAX=2500M\n'
+  printf '    RUNNER_MEMORY_MAX=3500M\n'
 
   if [[ -n "${MAX_RUNNERS:-}" || -n "${RUNNER_MEMORY_MAX:-}" ]]; then
     echo
