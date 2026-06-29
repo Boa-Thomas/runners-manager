@@ -130,8 +130,10 @@ stop_runner() {
 
   # If a systemd scope was created, stop it first — that sends SIGTERM to all
   # processes in the scope and cleans up the cgroup.
+  # Use || true: runner_state_get pipes through grep, which exits 1 when the
+  # key is absent; that would trip set -e on the bare assignment.
   local scope_unit
-  scope_unit=$(runner_state_get "$id" "scope_unit")
+  scope_unit=$(runner_state_get "$id" "scope_unit") || true
   if [[ -n "$scope_unit" ]] && command -v systemctl >/dev/null 2>&1; then
     systemctl --user stop "$scope_unit" 2>/dev/null || true
   fi

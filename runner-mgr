@@ -233,6 +233,7 @@ cmd_stop() {
 }
 
 cmd_start() {
+  require_env  # needed for RUNNER_MEMORY_MAX
   local target="${1:-}"
   [[ -n "$target" ]] || die "start: usage — runner-mgr start <id|all>"
   if [[ "$target" == "all" ]]; then
@@ -246,7 +247,7 @@ cmd_restart() {
   local target="${1:-}"
   [[ -n "$target" ]] || die "restart: usage — runner-mgr restart <id|all>"
   cmd_stop "$target"
-  cmd_start "$target"
+  cmd_start "$target"  # cmd_start calls require_env
 }
 
 cmd_status() {
