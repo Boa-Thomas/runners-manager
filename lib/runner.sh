@@ -86,8 +86,10 @@ start_runner() {
 
   if [[ -n "${RUNNER_MEMORY_MAX:-}" ]] && systemd_run_available; then
     local unit="runner-mgr-${id}"
-    # Stop any stale scope from a previous crash before (re)creating it.
+    # Clear any stale scope left by a previous crash (OOM-killed scopes land in
+    # "failed" state and block re-creation with the same unit name).
     systemctl --user stop "${unit}.scope" 2>/dev/null || true
+    systemctl --user reset-failed "${unit}.scope" 2>/dev/null || true
     # Launch in a transient user scope with a hard memory ceiling and no swap.
     # systemd-run stays alive as the scope controller until run.sh exits, so
     # the captured $! PID remains a valid liveness proxy for runner_is_running.
