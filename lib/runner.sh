@@ -65,6 +65,10 @@ configure_runner() {
 }
 
 # Start runner in background. Captures PID + logs.
+# When RUNNER_MEMORY_MAX is set and systemd-run is available, the runner is
+# launched inside a transient systemd scope so the kernel enforces the cap.
+# A single overloaded job is then OOM-killed in isolation rather than
+# thrashing every concurrent runner on the host.
 start_runner() {
   local id="$1" dir log pidfile
   dir="$(runner_dir "$id")"
@@ -78,9 +82,28 @@ start_runner() {
 
   mkdir -p "$RM_LOGS" "$RM_STATE"
   log_info "Starting runner-$id..."
-  # Use setsid so the process survives parent shell exit.
-  setsid bash -c "cd '$dir' && exec ./run.sh" >> "$log" 2>&1 < /dev/null &
-  local pid=$!
+  local pid
+
+  if [[ -n "${RUNNER_MEMORY_MAX:-}" ]] && systemd_run_available; then
+    local unit="runner-mgr-${id}"
+    # Stop any stale scope from a previous crash before (re)creating it.
+    systemctl --user stop "${unit}.scope" 2>/dev/null || true
+    # Launch in a transient user scope with a hard memory ceiling and no swap.
+    # systemd-run stays alive as the scope controller until run.sh exits, so
+    # the captured $! PID remains a valid liveness proxy for runner_is_running.
+    systemd-run --user --scope --quiet --unit="$unit" \
+      -p MemoryMax="${RUNNER_MEMORY_MAX}" -p MemorySwapMax=0 \
+      setsid bash -c "cd '$dir' && exec ./run.sh" >> "$log" 2>&1 < /dev/null &
+    pid=$!
+    runner_state_set "$id" "scope_unit" "${unit}.scope"
+    log_info "Memory cap: ${RUNNER_MEMORY_MAX} (scope: ${unit}.scope)"
+  else
+    # Fallback: no cgroup memory cap. Use setsid so the process survives
+    # parent shell exit.
+    setsid bash -c "cd '$dir' && exec ./run.sh" >> "$log" 2>&1 < /dev/null &
+    pid=$!
+  fi
+
   echo "$pid" > "$pidfile"
   runner_state_set "$id" "started_at" "$(date +%s)"
   runner_state_set "$id" "pid" "$pid"
@@ -104,6 +127,15 @@ stop_runner() {
   fi
   pid=$(cat "$pidfile")
   log_info "Stopping runner-$id (PID $pid)..."
+
+  # If a systemd scope was created, stop it first — that sends SIGTERM to all
+  # processes in the scope and cleans up the cgroup.
+  local scope_unit
+  scope_unit=$(runner_state_get "$id" "scope_unit")
+  if [[ -n "$scope_unit" ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl --user stop "$scope_unit" 2>/dev/null || true
+  fi
+
   # SIGTERM to the process group — run.sh spawns Runner.Listener as a child.
   kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
   for _ in {1..15}; do

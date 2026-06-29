@@ -48,6 +48,15 @@ require_cmd() {
   done
 }
 
+# Returns 0 when systemd-run --user --scope with memory limits is usable:
+# requires the binary, systemd as PID 1, and cgroup v2 memory controller.
+systemd_run_available() {
+  command -v systemd-run >/dev/null 2>&1 || return 1
+  [[ "$(ps -p 1 -o comm= 2>/dev/null)" == "systemd" ]] || return 1
+  [[ -f /sys/fs/cgroup/cgroup.controllers ]] \
+    && grep -q '\bmemory\b' /sys/fs/cgroup/cgroup.controllers 2>/dev/null
+}
+
 # State file per runner — JSON-ish key=value, one per line.
 runner_state_file() { echo "$RM_STATE/runner-$1.state"; }
 runner_dir()        { echo "$RM_RUNNERS/runner-$1"; }
