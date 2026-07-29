@@ -87,13 +87,17 @@ start_runner() {
   if [[ -n "${RUNNER_MEMORY_MAX:-}" ]] && systemd_run_available; then
     local unit="runner-mgr-${id}"
     # Clear any stale scope left by a previous crash (OOM-killed scopes land in
-    # "failed" state and block re-creation with the same unit name).
-    systemctl --user stop "${unit}.scope" 2>/dev/null || true
-    systemctl --user reset-failed "${unit}.scope" 2>/dev/null || true
-    # Launch in a transient user scope with a hard memory ceiling and no swap.
+    # "failed" state and block re-creation with the same unit name) and WAIT for
+    # systemd to fully release the name. 'systemctl stop' returns before a dying
+    # unit is unloaded, so re-creating immediately raced and failed with
+    # "Unit runner-mgr-N.scope was already loaded". Poll LoadState until the
+    # name is gone (~5s cap) before handing it back to systemd-run.
+    scope_teardown "$unit"
+    # --collect: garbage-collect the unit even if it later exits in 'failed'
+    # state (e.g. OOM-kill), so it never lingers to block the next start.
     # systemd-run stays alive as the scope controller until run.sh exits, so
     # the captured $! PID remains a valid liveness proxy for runner_is_running.
-    systemd-run --user --scope --quiet --unit="$unit" \
+    systemd-run --user --scope --quiet --collect --unit="$unit" \
       -p MemoryMax="${RUNNER_MEMORY_MAX}" -p MemorySwapMax=0 \
       setsid bash -c "cd '$dir' && exec ./run.sh" >> "$log" 2>&1 < /dev/null &
     pid=$!
@@ -109,6 +113,8 @@ start_runner() {
   echo "$pid" > "$pidfile"
   runner_state_set "$id" "started_at" "$(date +%s)"
   runner_state_set "$id" "pid" "$pid"
+  # Record intent so the watchdog knows this runner is meant to be up.
+  runner_state_set "$id" "desired_state" "running"
   sleep 1
   if kill -0 "$pid" 2>/dev/null; then
     log_ok "runner-$id started (PID $pid)"
@@ -122,6 +128,9 @@ start_runner() {
 stop_runner() {
   local id="$1" pidfile pid
   pidfile="$(runner_pidfile "$id")"
+  # Record intent BEFORE the early-return path so the watchdog won't resurrect a
+  # runner an operator deliberately stopped. Cleared again by start_runner.
+  runner_state_set "$id" "desired_state" "stopped"
   if ! runner_is_running "$id"; then
     log_dim "runner-$id not running"
     rm -f "$pidfile"

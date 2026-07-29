@@ -17,6 +17,10 @@ source "$RM_ROOT/lib/github.sh"
 source "$RM_ROOT/lib/runner.sh"
 # shellcheck disable=SC1091
 source "$RM_ROOT/lib/monitor.sh"
+# shellcheck disable=SC1091
+source "$RM_ROOT/lib/watchdog.sh"
+# shellcheck disable=SC1091
+source "$RM_ROOT/lib/qmon.sh"
 
 require_cmd jq curl tar
 
@@ -37,6 +41,14 @@ ${C_BOLD}COMMANDS${C_RESET}
   ${C_CYAN}restart${C_RESET} <id|all>        Stop then start
   ${C_CYAN}status${C_RESET}                  One-shot status snapshot
   ${C_CYAN}monitor${C_RESET} [interval]      Live dashboard (default: 2s refresh)
+  ${C_CYAN}watchdog${C_RESET} [interval]     Supervise runners; auto-restart the dead (default: 15s)
+  ${C_CYAN}install-service${C_RESET}         Run the watchdog as a systemd --user service (auto-start on boot)
+  ${C_CYAN}uninstall-service${C_RESET}       Remove the watchdog service
+  ${C_CYAN}logs-watchdog${C_RESET} [-f]      Show the watchdog log
+  ${C_CYAN}queue-check${C_RESET}             One-shot: check for a stuck queue / failing runners (logs + ntfy)
+  ${C_CYAN}install-queue-monitor${C_RESET}  Run queue-check every 30 min via a systemd --user timer
+  ${C_CYAN}uninstall-queue-monitor${C_RESET} Remove the queue-monitor timer
+  ${C_CYAN}logs-queue${C_RESET} [-f]         Show the queue-monitor log
   ${C_CYAN}list${C_RESET}                    List runners registered on the repo (raw)
   ${C_CYAN}logs${C_RESET} <id> [-f]          Show runner log (-f to follow)
   ${C_CYAN}clean${C_RESET}                   Remove offline/orphaned runners from GitHub
@@ -99,9 +111,9 @@ RUNNER_GROUP=default
 # Adjust to your available RAM. Run 'runner-mgr capacity' for guidance.
 MAX_RUNNERS=4
 # Per-runner cgroup memory ceiling. Requires systemd as PID 1 + cgroup v2.
-# Frontend vitest jobs (thread pool + --max-old-space-size=4096) create 10+
-# node processes and need ~3GB. 4 × 3500M = 14GB; mixed loads stay under 12GB.
-RUNNER_MEMORY_MAX=3500M
+# Must cover the heaviest job's peak (frontend vitest --max-old-space-size=4096
+# ~= 4GB). INVARIANT: MAX_RUNNERS × RUNNER_MEMORY_MAX + ~2GB OS <= WSL2 VM RAM.
+RUNNER_MEMORY_MAX=4096M
 EOF
   chmod 600 "$RM_ENV"
 
@@ -117,52 +129,45 @@ cmd_capacity() {
     set -a; source "$RM_ENV" 2>/dev/null || true; set +a
   fi
 
-  local cpus mem_total_mb mem_free_mb
+  local cpus total_mib reserve cap cap_mib usable fit cpu_cap rec
   cpus=$(nproc)
-  mem_total_mb=$(free -m | awk '/^Mem:/ {print $2}')
-  mem_free_mb=$(free -m  | awk '/^Mem:/ {print $7}')
+  total_mib=$(free -m | awk '/^Mem:/ {print $2}')
+  reserve=$MEM_OS_RESERVE_MIB
 
-  # Reserve ~4 cores and 2 GB for the OS + runner agent overhead.
-  local usable_cpus usable_mem
-  usable_cpus=$(( cpus - 4 )); (( usable_cpus < 1 )) && usable_cpus=1
-  usable_mem=$(( mem_free_mb - 2048 )); (( usable_mem < 1024 )) && usable_mem=1024
+  # RAM is the binding constraint for this CI (heavy Jest/vitest + Docker), so
+  # size by memory first, then sanity-cap on CPU. Use the configured per-runner
+  # cap (or a 4096M default that covers the heaviest job) as the divisor.
+  cap="${RUNNER_MEMORY_MAX:-4096M}"
+  cap_mib=$(mem_to_mib "$cap"); (( cap_mib > 0 )) || cap_mib=4096
+  usable=$(( total_mib - reserve )); (( usable < 0 )) && usable=0
+  fit=$(( usable / cap_mib ))
+  # CPU sanity: a heavy CI job uses ~2-4 vCPU; don't schedule more runners than
+  # half the cores or they thrash the scheduler.
+  cpu_cap=$(( cpus / 2 )); (( cpu_cap < 1 )) && cpu_cap=1
+  rec=$fit; (( cpu_cap < rec )) && rec=$cpu_cap
+  (( rec < 1 )) && rec=1
 
-  # Per-runner footprints calibrated for this CI workload:
-  #   Heavy  — Docker + Postgres + Jest (backend-tests shard): ~2.5 GB
-  #   Medium — Node/Py/Go without containers:                  ~1.5 GB
-  #   Light  — lint / deploy / IO only:                        ~512 MB
-  local heavy med light
-  heavy=$(( usable_cpus / 4 ))
-  med=$(( usable_cpus / 2 ))
-  light=$usable_cpus
-  local heavy_m med_m light_m
-  heavy_m=$(( usable_mem / 2560 ))
-  med_m=$(( usable_mem / 1536 ))
-  light_m=$(( usable_mem / 512 ))
-  (( heavy_m < heavy )) && heavy=$heavy_m
-  (( med_m   < med   )) && med=$med_m
-  (( light_m < light )) && light=$light_m
-
-  printf '%sCapacity estimate%s — %d CPUs, %d/%d MiB free/total RAM\n' \
-    "$C_BOLD" "$C_RESET" "$cpus" "$mem_free_mb" "$mem_total_mb"
-  printf '  %sHeavy jobs%s  (Docker+Postgres CI):  %s%d runners%s  %s(~2.5 GB each)%s\n' \
-    "$C_DIM" "$C_RESET" "$C_GREEN" "$heavy" "$C_RESET" "$C_DIM" "$C_RESET"
-  printf '  %sMedium jobs%s (Node/Py/Go):           %s%d runners%s  %s(~1.5 GB each)%s\n' \
-    "$C_DIM" "$C_RESET" "$C_GREEN" "$med" "$C_RESET" "$C_DIM" "$C_RESET"
-  printf '  %sLight jobs%s  (lint/deploy/IO):       %s%d runners%s  %s(~512 MB each)%s\n' \
-    "$C_DIM" "$C_RESET" "$C_GREEN" "$light" "$C_RESET" "$C_DIM" "$C_RESET"
+  printf '%sCapacity estimate%s — %d CPUs, %d MiB total VM RAM (reserve %d MiB for OS)\n' \
+    "$C_BOLD" "$C_RESET" "$cpus" "$total_mib" "$reserve"
+  printf '  Per-runner cap %s%s%s (%d MiB) → RAM fits %s%d%s runners; CPU allows %s%d%s\n' \
+    "$C_BOLD" "$cap" "$C_RESET" "$cap_mib" "$C_GREEN" "$fit" "$C_RESET" "$C_GREEN" "$cpu_cap" "$C_RESET"
   echo
-  printf '  %sRecommended for this host (heavy CI): %d runners%s\n' "$C_BOLD" "$heavy" "$C_RESET"
-  echo
-  printf '  %sSuggested .env settings:%s\n' "$C_DIM" "$C_RESET"
-  printf '    MAX_RUNNERS=%d\n' "$heavy"
-  printf '    RUNNER_MEMORY_MAX=3500M\n'
+  printf '  %sRecommended: MAX_RUNNERS=%d  RUNNER_MEMORY_MAX=%s%s\n' "$C_BOLD" "$rec" "$cap" "$C_RESET"
+  printf '  %sInvariant: MAX_RUNNERS × RUNNER_MEMORY_MAX + %dMiB OS ≤ %dMiB VM%s\n' \
+    "$C_DIM" "$reserve" "$total_mib" "$C_RESET"
 
-  if [[ -n "${MAX_RUNNERS:-}" || -n "${RUNNER_MEMORY_MAX:-}" ]]; then
+  if [[ -n "${MAX_RUNNERS:-}" && -n "${RUNNER_MEMORY_MAX:-}" ]]; then
     echo
-    printf '  %sCurrent .env settings:%s\n' "$C_DIM" "$C_RESET"
-    [[ -n "${MAX_RUNNERS:-}" ]]       && printf '    MAX_RUNNERS=%s\n' "$MAX_RUNNERS"
-    [[ -n "${RUNNER_MEMORY_MAX:-}" ]] && printf '    RUNNER_MEMORY_MAX=%s\n' "$RUNNER_MEMORY_MAX"
+    printf '  %sCurrent .env: MAX_RUNNERS=%s  RUNNER_MEMORY_MAX=%s%s\n' \
+      "$C_DIM" "$MAX_RUNNERS" "$RUNNER_MEMORY_MAX" "$C_RESET"
+    local rc=0
+    memory_budget_check "$MAX_RUNNERS" || rc=$?
+    if (( rc == 0 )); then
+      printf '    %s✓ fits: needs %d MiB of %d MiB VM%s\n' "$C_GREEN" "$MB_NEED" "$MB_TOTAL" "$C_RESET"
+    elif (( rc == 1 )); then
+      printf '    %s✗ OVERSUBSCRIBED: needs %d MiB but VM has %d MiB — will OOM under load%s\n' \
+        "$C_RED" "$MB_NEED" "$MB_TOTAL" "$C_RESET"
+    fi
   fi
 }
 
@@ -184,18 +189,32 @@ cmd_up() {
 
   # Enforce MAX_RUNNERS cap (set in .env). Prevents accidental oversubscription
   # of host RAM when many concurrent CI jobs run simultaneously.
+  local current
+  current=$(list_local_runners | wc -l)
+  local projected=$((current + n))
+
   local max="${MAX_RUNNERS:-0}"
   if (( max > 0 )); then
-    local current
-    current=$(list_local_runners | wc -l)
-    if (( current + n > max )); then
+    if (( projected > max )); then
       if (( ! force )); then
-        die "up: would start $((current + n)) runners but MAX_RUNNERS=${max} (currently ${current}). " \
+        die "up: would start ${projected} runners but MAX_RUNNERS=${max} (currently ${current}). " \
             "Remove runners first ('runner-mgr down'), check 'runner-mgr capacity', or pass --force to override."
       else
-        log_warn "Overriding MAX_RUNNERS=${max} cap (--force). Will have $((current + n)) total runners."
+        log_warn "Overriding MAX_RUNNERS=${max} cap (--force). Will have ${projected} total runners."
       fi
     fi
+  fi
+
+  # Memory-budget preflight: projected × RUNNER_MEMORY_MAX + OS reserve must fit
+  # VM RAM, else concurrent heavy jobs OOM-kill each other. This is the failure
+  # mode that made runs flaky (14GB of caps on a 12GB VM). rc: 0=fits 1=over 2=n/a
+  local budget_rc=0
+  memory_budget_check "$projected" || budget_rc=$?
+  if (( budget_rc == 1 )); then
+    log_warn "Memory budget: ${projected} × ${RUNNER_MEMORY_MAX} + ${MEM_OS_RESERVE_MIB}MiB OS = ${MB_NEED}MiB needed, but VM has only ${MB_TOTAL}MiB."
+    log_warn "This oversubscribes RAM and invites OOM kills. Lower MAX_RUNNERS/RUNNER_MEMORY_MAX, or raise the WSL2 VM (.wslconfig) — run 'runner-mgr capacity'."
+    (( force )) || die "up: refusing to oversubscribe memory. Pass --force to override."
+    log_warn "Proceeding despite oversubscription (--force)."
   fi
 
   log_info "Provisioning $n runner(s)..."
@@ -257,6 +276,117 @@ cmd_status() {
 
 cmd_monitor() {
   live_monitor "${1:-2}"
+}
+
+cmd_watchdog() {
+  watchdog_loop "${1:-15}"
+}
+
+# Install a systemd --user service that runs the watchdog on boot and keeps it
+# alive. Enables linger so it survives logout / starts after `wsl --shutdown`.
+cmd_install_service() {
+  systemd_run_available || die "install-service needs systemd as PID 1 (WSL2 with systemd=true)."
+  local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  local unit_file="$unit_dir/runner-mgr-watchdog.service"
+  local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
+  mkdir -p "$unit_dir"
+  cat > "$unit_file" <<EOF
+[Unit]
+Description=runner-mgr watchdog — keeps GitHub Actions self-hosted runners alive
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=${self} watchdog 15
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+EOF
+  log_ok "Wrote $unit_file"
+  systemctl --user daemon-reload
+  systemctl --user enable --now runner-mgr-watchdog.service
+  log_ok "Enabled + started runner-mgr-watchdog.service"
+  if loginctl enable-linger "$USER" 2>/dev/null; then
+    log_ok "Linger enabled — watchdog will auto-start on boot (survives wsl --shutdown)."
+  else
+    log_warn "Could not enable linger automatically. Run: sudo loginctl enable-linger $USER"
+    log_warn "Without it the watchdog won't auto-start until you open a WSL shell after boot."
+  fi
+  log_info "Follow it with: journalctl --user -u runner-mgr-watchdog -f   (or: runner-mgr logs-watchdog)"
+}
+
+cmd_uninstall_service() {
+  systemctl --user disable --now runner-mgr-watchdog.service 2>/dev/null || true
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/runner-mgr-watchdog.service"
+  systemctl --user daemon-reload 2>/dev/null || true
+  log_ok "Removed runner-mgr-watchdog.service"
+}
+
+cmd_logs_watchdog() {
+  local log; log="$(watchdog_log_file)"
+  [[ -f "$log" ]] || die "No watchdog log yet at $log"
+  if [[ "${1:-}" == "-f" ]]; then tail -f "$log"; else tail -n 100 "$log"; fi
+}
+
+cmd_queue_check() {
+  qmon_check
+}
+
+cmd_logs_queue() {
+  local log; log="$(qmon_log_file)"
+  [[ -f "$log" ]] || die "No queue-monitor log yet at $log — run: runner-mgr queue-check"
+  if [[ "${1:-}" == "-f" ]]; then tail -f "$log"; else tail -n 100 "$log"; fi
+}
+
+# Install a systemd --user timer that runs queue-check every 30 minutes.
+cmd_install_queue_monitor() {
+  systemd_run_available || die "install-queue-monitor needs systemd as PID 1 (WSL2 with systemd=true)."
+  [[ -n "${NTFY_TOPIC:-}" ]] || log_warn "NTFY_TOPIC is unset in .env — the monitor will log but not push. Set it to get alerts."
+  local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
+  mkdir -p "$unit_dir"
+  cat > "$unit_dir/runner-mgr-queue.service" <<EOF
+[Unit]
+Description=runner-mgr queue monitor — alert on a stuck queue / failing runners
+
+[Service]
+Type=oneshot
+ExecStart=${self} queue-check
+TimeoutStartSec=180
+EOF
+  cat > "$unit_dir/runner-mgr-queue.timer" <<EOF
+[Unit]
+Description=Run runner-mgr queue-check every 30 minutes
+
+[Timer]
+OnBootSec=3min
+OnCalendar=*:0/30
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  log_ok "Wrote runner-mgr-queue.service + .timer to $unit_dir"
+  systemctl --user daemon-reload
+  systemctl --user enable --now runner-mgr-queue.timer
+  log_ok "Enabled + started runner-mgr-queue.timer (every :00 and :30)"
+  if loginctl enable-linger "$USER" 2>/dev/null; then
+    log_ok "Linger enabled — timer survives logout / wsl --shutdown."
+  else
+    log_warn "Could not enable linger. Run: sudo loginctl enable-linger $USER"
+  fi
+  log_info "Next runs: systemctl --user list-timers runner-mgr-queue.timer"
+  log_info "Log: runner-mgr logs-queue -f"
+}
+
+cmd_uninstall_queue_monitor() {
+  systemctl --user disable --now runner-mgr-queue.timer 2>/dev/null || true
+  rm -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/runner-mgr-queue.timer" \
+        "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/runner-mgr-queue.service"
+  systemctl --user daemon-reload 2>/dev/null || true
+  log_ok "Removed runner-mgr-queue.timer + .service"
 }
 
 cmd_list() {
@@ -326,6 +456,10 @@ main() {
     setup)          cmd_setup "$@"; return ;;
     capacity)       cmd_capacity "$@"; return ;;
     logs)           cmd_logs "$@"; return ;;
+    logs-watchdog)  cmd_logs_watchdog "$@"; return ;;
+    logs-queue)     cmd_logs_queue "$@"; return ;;
+    uninstall-service) cmd_uninstall_service "$@"; return ;;
+    uninstall-queue-monitor) cmd_uninstall_queue_monitor "$@"; return ;;
     stop|start|restart) "cmd_${cmd}" "$@"; return ;;
   esac
 
@@ -337,6 +471,10 @@ main() {
     down)     cmd_down "$@" ;;
     status)   cmd_status "$@" ;;
     monitor)  cmd_monitor "$@" ;;
+    watchdog) cmd_watchdog "$@" ;;
+    install-service)   cmd_install_service "$@" ;;
+    queue-check)       cmd_queue_check "$@" ;;
+    install-queue-monitor) cmd_install_queue_monitor "$@" ;;
     list)     cmd_list "$@" ;;
     clean)    cmd_clean "$@" ;;
     update)   cmd_update "$@" ;;

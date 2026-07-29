@@ -57,6 +57,62 @@ systemd_run_available() {
     && grep -q '\bmemory\b' /sys/fs/cgroup/cgroup.controllers 2>/dev/null
 }
 
+# Fully tear down a transient user scope by unit stem (without ".scope") and
+# block until systemd no longer knows the name, so a subsequent
+# 'systemd-run --unit=<stem>' can't collide with a lingering/failed unit.
+# 'systemctl stop' is async for a unit that is already dying (e.g. OOM-killed),
+# and OOM-killed scopes stay 'loaded' in failed state until reset-failed — both
+# caused the "Unit runner-mgr-N.scope was already loaded" start failure.
+scope_teardown() {
+  local unit="$1" scope="${1}.scope" i=0 load
+  systemctl --user stop "$scope" 2>/dev/null || true
+  systemctl --user reset-failed "$scope" 2>/dev/null || true
+  # Poll LoadState until the unit name is released (or ~5s elapses).
+  while (( i++ < 50 )); do
+    load=$(systemctl --user show "$scope" -p LoadState --value 2>/dev/null || echo "")
+    [[ "$load" == "not-found" || -z "$load" ]] && return 0
+    systemctl --user reset-failed "$scope" 2>/dev/null || true
+    sleep 0.1
+  done
+  return 0
+}
+
+# RAM to reserve for the OS + runner agents when sizing the memory budget.
+MEM_OS_RESERVE_MIB="${MEM_OS_RESERVE_MIB:-2048}"
+
+# Parse a memory size (e.g. "4096M", "3.5G", "512", "8GB") to integer MiB.
+# Bare numbers are treated as MiB (matches systemd's default-ish usage here).
+mem_to_mib() {
+  local v="${1:-}" n unit
+  v="${v//[[:space:]]/}"
+  [[ -n "$v" ]] || { echo 0; return; }
+  n="${v//[^0-9.]/}"; unit="${v//[0-9.]/}"
+  [[ -n "$n" ]] || { echo 0; return; }
+  case "${unit^^}" in
+    ""|M|MB|MI|MIB) awk -v n="$n" 'BEGIN{printf "%d", n}' ;;
+    G|GB|GI|GIB)    awk -v n="$n" 'BEGIN{printf "%d", n*1024}' ;;
+    K|KB|KI|KIB)    awk -v n="$n" 'BEGIN{printf "%d", n/1024}' ;;
+    T|TB|TI|TIB)    awk -v n="$n" 'BEGIN{printf "%d", n*1024*1024}' ;;
+    *)              echo 0 ;;
+  esac
+}
+
+# Verify a runner count fits VM RAM: count × RUNNER_MEMORY_MAX + OS reserve
+# must be <= total VM memory. Sets MB_NEED/MB_TOTAL/MB_CAP globals for callers
+# to print. Returns 0 if it fits, 1 if oversubscribed, 2 if not checkable.
+memory_budget_check() {
+  local n="${1:-0}" cap="${RUNNER_MEMORY_MAX:-}"
+  MB_NEED=0 MB_TOTAL=0 MB_CAP=0
+  [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) || return 2
+  [[ -n "$cap" ]] || return 2
+  local cap_mib total_mib
+  cap_mib=$(mem_to_mib "$cap"); (( cap_mib > 0 )) || return 2
+  total_mib=$(free -m | awk '/^Mem:/ {print $2}')
+  MB_CAP=$cap_mib; MB_TOTAL=$total_mib
+  MB_NEED=$(( n * cap_mib + MEM_OS_RESERVE_MIB ))
+  (( MB_NEED <= total_mib ))
+}
+
 # State file per runner — JSON-ish key=value, one per line.
 runner_state_file() { echo "$RM_STATE/runner-$1.state"; }
 runner_dir()        { echo "$RM_RUNNERS/runner-$1"; }
