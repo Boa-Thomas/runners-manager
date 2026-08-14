@@ -31,14 +31,22 @@ qmon_state_get() {
   grep -E "^${key}=" "$file" | tail -1 | cut -d= -f2-
 }
 
+# Rewrite-then-move instead of `sed -i "s|...|...|"`. The old version used `|`
+# as the sed delimiter, and the stuck-queue signature CONTAINS `|`
+# ("down0|q1|idle0"), so any transition into that signature died with
+# "unknown option to `s'" and silently left last_alert_sig stale. With the
+# signature never persisting, the de-dup in qmon_maybe_notify compared against
+# the old value forever and re-pushed the same ntfy alert every 30 min.
+# No delimiter here means no value can break it.
 qmon_state_set() {
   local key="$1" val="$2" file; file="$(qmon_state_file)"
   mkdir -p "$(dirname "$file")"
-  if [[ -f "$file" ]] && grep -qE "^${key}=" "$file"; then
-    sed -i "s|^${key}=.*|${key}=${val}|" "$file"
-  else
-    echo "${key}=${val}" >> "$file"
-  fi
+  local tmp="${file}.tmp.$$"
+  {
+    [[ -f "$file" ]] && grep -vE "^${key}=" "$file" || true
+    echo "${key}=${val}"
+  } > "$tmp"
+  mv -f "$tmp" "$file"
 }
 
 qmon_log() {

@@ -128,15 +128,23 @@ runner_state_get() {
 }
 
 # Set a key in a runner state file (create or replace).
+#
+# Rewrite-then-move instead of `sed -i "s|^${key}=.*|${key}=${value}|"`: that
+# used `|` as the sed delimiter, so any value CONTAINING `|` blew up with
+# "unknown option to `s'" and left the old value in place, silently. Reachable
+# today via `labels` (comes from RUNNER_LABELS in .env — user-controlled). The
+# same bug bit qmon_state_set for real, where the stuck-queue signature has
+# literal `|` in it. No delimiter here means no value can break it.
 runner_state_set() {
   local id="$1" key="$2" value="$3" file
   file="$(runner_state_file "$id")"
   mkdir -p "$(dirname "$file")"
-  if [[ -f "$file" ]] && grep -qE "^${key}=" "$file"; then
-    sed -i "s|^${key}=.*|${key}=${value}|" "$file"
-  else
-    echo "${key}=${value}" >> "$file"
-  fi
+  local tmp="${file}.tmp.$$"
+  {
+    [[ -f "$file" ]] && grep -vE "^${key}=" "$file" || true
+    echo "${key}=${value}"
+  } > "$tmp"
+  mv -f "$tmp" "$file"
 }
 
 # List all local runner IDs (numeric, sorted).
