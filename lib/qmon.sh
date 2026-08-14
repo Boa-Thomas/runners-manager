@@ -7,9 +7,10 @@
 #   - GitHub unreachable / PAT rejected (runners invisible from our side).
 #   - Fewer runners online than expected (a runner died / went offline).
 #   - Queue non-empty AND no runner online at all (nothing can consume it).
-#   - Queue non-empty AND zero idle capacity, sustained across checks
-#     (>= QMON_STUCK_SECS) — a transient burst that drains in one interval does
-#     not alert.
+#   - Zero idle capacity AND the OLDEST queued run has been waiting
+#     >= QMON_STUCK_SECS. E a idade do run mais antigo, nao ha quanto tempo a
+#     fila esta nao-vazia: com 100% de utilizacao sempre ha algo enfileirado,
+#     entao medir "fila nao-vazia" acusava saude como se fosse problema.
 #
 # De-dup: a given problem signature pushes once; it re-pushes only when the
 # situation changes, and sends one recovery ping when things normalise.
@@ -99,6 +100,18 @@ qmon_count_runs() {
   [[ "$n" =~ ^[0-9]+$ ]] && echo "$n" || echo 0
 }
 
+# Idade em segundos do run enfileirado mais antigo que pode usar nossos
+# runners. Ecoa 0 quando nao ha nenhum. Mesmo filtro de `dynamic` acima.
+qmon_oldest_queued_age() {
+  local created t now
+  created=$(gh_curl GET "/repos/${GITHUB_REPO}/actions/runs?status=queued&per_page=100" \
+        | jq -r '[(.workflow_runs // [])[] | select(.event != "dynamic") | .created_at] | min // empty' 2>/dev/null)
+  [[ -z "$created" || "$created" == "null" ]] && { echo 0; return; }
+  t=$(date -d "$created" +%s 2>/dev/null) || { echo 0; return; }
+  now=$(date +%s)
+  (( now > t )) && echo $(( now - t )) || echo 0
+}
+
 # One evaluation pass. Returns 0 always (a monitor shouldn't fail the timer);
 # problems are reported via log + ntfy.
 qmon_check() {
@@ -135,18 +148,17 @@ qmon_check() {
   idle=$(( online - busy )); (( idle < 0 )) && idle=0
 
   # --- queue depth ---
-  local queued now queued_since queued_for
+  # `queued_for` = idade do run enfileirado MAIS ANTIGO, nao ha quanto tempo a
+  # fila esta continuamente nao-vazia (que era o que o antigo `queued_since`
+  # media). A diferenca importa: um CI saudavel e bem utilizado quase sempre
+  # tem algum run esperando, entao aquele contador nunca zerava e crescia para
+  # sempre — 100% de utilizacao disparava "fila parada". Visto na pratica:
+  # alerta de "2 run(s) ha 26min sem runner ocioso" com a fila drenando normal.
+  # Idade do mais antigo distingue os dois casos: fila cheia com runs jovens e
+  # saude; run especifico parado ha 25min e problema.
+  local queued queued_for
   queued="$(qmon_count_runs queued)"
-  now=$(date +%s)
-  queued_since="$(qmon_state_get queued_since)"
-  if (( queued > 0 )); then
-    [[ "$queued_since" =~ ^[0-9]+$ ]] && (( queued_since > 0 )) || queued_since="$now"
-  else
-    queued_since=0
-  fi
-  qmon_state_set queued_since "$queued_since"
-  queued_for=0
-  (( queued_since > 0 )) && queued_for=$(( now - queued_since ))
+  queued_for="$(qmon_oldest_queued_age)"
 
   # --- decide ---
   local -a problems=()
@@ -157,7 +169,7 @@ qmon_check() {
     if (( online == 0 )); then
       problems+=("fila com ${queued} run(s) e NENHUM runner online")
     elif (( idle == 0 && queued_for >= QMON_STUCK_SECS )); then
-      problems+=("fila parada: ${queued} run(s) ha $((queued_for/60))min sem runner ocioso")
+      problems+=("fila parada: run mais antigo esperando ha $((queued_for/60))min com 0 runner ocioso (${queued} na fila)")
     fi
   fi
 
