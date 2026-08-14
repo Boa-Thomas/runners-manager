@@ -189,7 +189,10 @@ remove_runner() {
     fi
   fi
 
-  rm -rf "$dir"
+  # `${dir:?}` — se $dir vier vazio por qualquer motivo, o shell aborta em vez
+  # de expandir para `rm -rf ""`. Custo zero e fecha a variante "variavel vazia
+  # em caminho destrutivo", que ja causou um incidente neste projeto.
+  rm -rf "${dir:?diretorio do runner vazio — abortando}"
   rm -f "$(runner_state_file "$id")" "$(runner_pidfile "$id")"
   log_ok "runner-$id removed"
 }

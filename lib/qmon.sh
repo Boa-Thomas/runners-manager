@@ -129,11 +129,26 @@ qmon_oldest_unstarted_age() {
   now=$(date +%s)
   while read -r id created; do
     [[ -n "$id" ]] || continue
-    # Algum job deste run ja saiu de `queued`?
-    started=$(gh_curl GET "/repos/${GITHUB_REPO}/actions/runs/${id}/jobs?per_page=100" \
-          | jq '[(.jobs // [])[] | select(.status != "queued")] | length' 2>/dev/null || echo 0)
-    [[ "$started" =~ ^[0-9]+$ ]] || started=0
-    (( started > 0 )) && continue          # ja esta sendo trabalhado, nao conta
+    # Algum job deste run REALMENTE comecou?
+    #
+    # Nao basta `status != "queued"`: job `skipped` tambem sai de queued, e
+    # completa instantaneamente. Este monorepo tem o job `changes` com
+    # path-filters, entao um PR estreito produz varios `completed/skipped`.
+    # Um run cujos jobs REAIS estao todos esperando slot apareceria como "ja
+    # comecou" so por causa dos pulados — e o run genuinamente parado ficaria
+    # invisivel para o alerta. Visto na pratica: run com 5 skipped em que este
+    # filtro contava 7 iniciados quando o certo eram 2.
+    #
+    # `|| echo 0` seria pior que inutil aqui: uma falha de rede viraria
+    # "nada comecou" e ressuscitaria o falso positivo. Em caso de erro,
+    # pula o run em vez de chutar.
+    local jobs_json
+    jobs_json=$(gh_curl GET "/repos/${GITHUB_REPO}/actions/runs/${id}/jobs?per_page=100") || continue
+    started=$(echo "$jobs_json" | jq '[(.jobs // [])[]
+                | select(.status == "in_progress"
+                         or (.status == "completed" and .conclusion != "skipped"))] | length' 2>/dev/null)
+    [[ "$started" =~ ^[0-9]+$ ]] || continue   # resposta inesperada: nao chuta
+    (( started > 0 )) && continue              # ja esta sendo trabalhado, nao conta
     t=$(date -d "$created" +%s 2>/dev/null) || continue
     (( now > t )) && echo $(( now - t )) || echo 0
     return
@@ -149,7 +164,7 @@ qmon_check() {
   # Expected online = local runners not deliberately stopped (matches watchdog).
   local expected=0 id ds
   for id in $(list_local_runners); do
-    ds="$(runner_state_get "$id" desired_state)"
+    ds="$(runner_state_get "$id" desired_state)" || true   # sem isto, chave ausente aborta o check inteiro sob set -e
     [[ "$ds" == "stopped" ]] || expected=$((expected + 1))
   done
 

@@ -429,10 +429,20 @@ cmd_clean() {
   log_info "Cleaning up local runner dirs without process or registration..."
   for id in $(list_local_runners); do
     if ! runner_is_running "$id"; then
-      local name; name=$(runner_state_get "$id" "name")
-      if [[ -n "$name" ]] && [[ -z "$(gh_runner_id_by_name "$name")" ]]; then
+      local name; name=$(runner_state_get "$id" "name") || true
+      # ATENCAO — caminho destrutivo decidido por resposta de API.
+      # `gh_runner_id_by_name` devolve vazio tanto para "nao existe no GitHub"
+      # quanto para "a chamada falhou" (rate limit, 403, rede): `gh_curl` nao
+      # checa status HTTP, entao um body de erro vira `[]` no jq. Sem a
+      # confirmacao abaixo, um runner registrado-e-parado seria tratado como
+      # orfao e teria o diretorio apagado, deixando a registracao pendurada.
+      # So apaga se a API respondeu E respondeu que nao conhece este runner.
+      local gh_ok=0
+      gh_list_runners >/dev/null 2>&1 && gh_ok=1
+      if [[ -n "$name" ]] && (( gh_ok )) && [[ -z "$(gh_runner_id_by_name "$name")" ]]; then
         log_info "Removing orphan local runner-$id"
-        rm -rf "$(runner_dir "$id")"
+        local dir; dir="$(runner_dir "$id")"
+        rm -rf "${dir:?diretorio do runner vazio — abortando}"
         rm -f "$(runner_state_file "$id")" "$(runner_pidfile "$id")"
         count=$((count+1))
       fi
