@@ -7,10 +7,17 @@
 #   - GitHub unreachable / PAT rejected (runners invisible from our side).
 #   - Fewer runners online than expected (a runner died / went offline).
 #   - Queue non-empty AND no runner online at all (nothing can consume it).
-#   - Zero idle capacity AND the OLDEST queued run has been waiting
-#     >= QMON_STUCK_SECS. E a idade do run mais antigo, nao ha quanto tempo a
-#     fila esta nao-vazia: com 100% de utilizacao sempre ha algo enfileirado,
-#     entao medir "fila nao-vazia" acusava saude como se fosse problema.
+#   - Zero idle capacity AND o run mais antigo em que NADA comecou espera
+#     >= QMON_STUCK_SECS.
+#
+#     Duas armadilhas ja pisadas nessa metrica, as duas por confiar num numero
+#     agregado sem checar o que ele mede:
+#       1. "ha quanto tempo a fila esta nao-vazia" nunca resetava com 100% de
+#          utilizacao, entao saude virava alerta.
+#       2. "idade do run `queued` mais antigo" tambem engana: o GitHub marca o
+#          RUN como queued enquanto QUALQUER job dele espera slot. Visto aqui um
+#          run com 8 de 9 jobs concluidos ainda rotulado "queued".
+#     Por isso a medida e sobre run em que NENHUM job comecou.
 #
 # De-dup: a given problem signature pushes once; it re-pushes only when the
 # situation changes, and sends one recovery ping when things normalise.
@@ -100,16 +107,38 @@ qmon_count_runs() {
   [[ "$n" =~ ^[0-9]+$ ]] && echo "$n" || echo 0
 }
 
-# Idade em segundos do run enfileirado mais antigo que pode usar nossos
-# runners. Ecoa 0 quando nao ha nenhum. Mesmo filtro de `dynamic` acima.
-qmon_oldest_queued_age() {
-  local created t now
-  created=$(gh_curl GET "/repos/${GITHUB_REPO}/actions/runs?status=queued&per_page=100" \
-        | jq -r '[(.workflow_runs // [])[] | select(.event != "dynamic") | .created_at] | min // empty' 2>/dev/null)
-  [[ -z "$created" || "$created" == "null" ]] && { echo 0; return; }
-  t=$(date -d "$created" +%s 2>/dev/null) || { echo 0; return; }
+# Idade em segundos do run mais antigo que AINDA NAO COMECOU — nenhum job dele
+# iniciado. Ecoa 0 quando nao ha nenhum.
+#
+# Por que nao basta olhar `status=queued`: o GitHub marca o RUN como `queued`
+# enquanto QUALQUER job dele espera slot, mesmo com os outros ja rodando ou
+# concluidos. Observado neste repo: um run com `completed: 8, queued: 1` — 8 de
+# 9 jobs prontos — aparecia como "enfileirado". Medir a idade desse run diria
+# "esperando ha 30min" sobre algo que esta quase terminando, e o alerta de fila
+# parada dispararia com a fila andando normalmente.
+#
+# O que interessa e run em que NADA comecou: esse sim esta realmente esperando.
+# Varre do mais antigo para o mais novo e para no primeiro que nao tem job
+# iniciado — normalmente 1 ou 2 chamadas extras, nao uma por run.
+qmon_oldest_unstarted_age() {
+  local runs ids id created t now started
+  runs=$(gh_curl GET "/repos/${GITHUB_REPO}/actions/runs?status=queued&per_page=100" \
+        | jq -r '[(.workflow_runs // [])[] | select(.event != "dynamic")]
+                 | sort_by(.created_at) | .[] | "\(.id) \(.created_at)"' 2>/dev/null)
+  [[ -z "$runs" ]] && { echo 0; return; }
   now=$(date +%s)
-  (( now > t )) && echo $(( now - t )) || echo 0
+  while read -r id created; do
+    [[ -n "$id" ]] || continue
+    # Algum job deste run ja saiu de `queued`?
+    started=$(gh_curl GET "/repos/${GITHUB_REPO}/actions/runs/${id}/jobs?per_page=100" \
+          | jq '[(.jobs // [])[] | select(.status != "queued")] | length' 2>/dev/null || echo 0)
+    [[ "$started" =~ ^[0-9]+$ ]] || started=0
+    (( started > 0 )) && continue          # ja esta sendo trabalhado, nao conta
+    t=$(date -d "$created" +%s 2>/dev/null) || continue
+    (( now > t )) && echo $(( now - t )) || echo 0
+    return
+  done <<< "$runs"
+  echo 0                                    # todos os enfileirados ja comecaram
 }
 
 # One evaluation pass. Returns 0 always (a monitor shouldn't fail the timer);
@@ -158,7 +187,7 @@ qmon_check() {
   # saude; run especifico parado ha 25min e problema.
   local queued queued_for
   queued="$(qmon_count_runs queued)"
-  queued_for="$(qmon_oldest_queued_age)"
+  queued_for="$(qmon_oldest_unstarted_age)"
 
   # --- decide ---
   local -a problems=()
@@ -173,7 +202,7 @@ qmon_check() {
     fi
   fi
 
-  local summary="queued=${queued} online=${online}/${expected} busy=${busy} idle=${idle}"
+  local summary="queued=${queued} espera_max=$((queued_for/60))min online=${online}/${expected} busy=${busy} idle=${idle}"
 
   if (( ${#problems[@]} > 0 )); then
     local msg; msg="$(printf '%s; ' "${problems[@]}")"; msg="${msg%; }"
