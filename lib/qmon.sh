@@ -85,10 +85,17 @@ qmon_maybe_notify() {
 
 # Count workflow runs currently in a given status (capped at 100 — enough to
 # distinguish "empty" from "backed up").
+# Runs com `event == "dynamic"` sao do Dependabot (os "npm_and_yarn in /x").
+# Eles rodam na infraestrutura do GitHub e NUNCA consomem runner self-hosted,
+# mas ficam em `queued` por horas — foram vistos 7 parados de 4h a 16h com os
+# 4 runners ociosos. Contar isso criava um piso permanente na profundidade da
+# fila: a fila nunca aparecia vazia, e bastava os 4 runners ficarem ocupados
+# para o alerta de "fila parada" disparar por causa de runs que nao dependem
+# de runner nenhum. So conta o que a nossa capacidade pode de fato consumir.
 qmon_count_runs() {
   local status="$1" n
   n=$(gh_curl GET "/repos/${GITHUB_REPO}/actions/runs?status=${status}&per_page=100" \
-        | jq '(.workflow_runs // []) | length' 2>/dev/null || echo 0)
+        | jq '[(.workflow_runs // [])[] | select(.event != "dynamic")] | length' 2>/dev/null || echo 0)
   [[ "$n" =~ ^[0-9]+$ ]] && echo "$n" || echo 0
 }
 
