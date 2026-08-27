@@ -22,7 +22,7 @@ source "$RM_ROOT/lib/watchdog.sh"
 # shellcheck disable=SC1091
 source "$RM_ROOT/lib/qmon.sh"
 
-require_cmd jq curl tar
+require_cmd jq curl tar sha256sum realpath
 
 cmd_help() {
   cat <<EOF
@@ -78,6 +78,14 @@ ${C_BOLD}SIZING VARIABLES${C_RESET} (set in .env)
                               Requires systemd as PID 1 + cgroup v2. A job exceeding
                               the cap is OOM-killed in isolation rather than thrashing
                               its neighbours. Run 'runner-mgr capacity' for guidance.
+
+${C_BOLD}ISOLAMENTO${C_RESET} (set in .env — veja SECURITY.md)
+  ${C_CYAN}RUNNER_EPHEMERAL${C_RESET}=1         Runner atende UM job e se desregistra (padrao: 1).
+                              E a fronteira entre jobs. Desligar so com motivo.
+  ${C_CYAN}RUNNER_WIPE_WORK${C_RESET}=1         Limpa o _work entre jobs (padrao: 1). Custa cache
+                              local de build.
+  ${C_CYAN}RUNNER_SKIP_CHECKSUM${C_RESET}=0     Pula a verificacao SHA256 do tarball do runner.
+                              Nao ligue: o tarball e executado.
 EOF
 }
 
@@ -91,7 +99,10 @@ cmd_setup() {
     [[ "$ans" =~ ^[Yy]$ ]] || { log_info "Aborted."; exit 0; }
   fi
 
-  read -rp "GitHub Personal Access Token (scope: repo): " token
+  # -s: sem eco. Antes o PAT ficava visivel na tela, no scrollback e em
+  # qualquer gravacao de sessao (script, asciinema, screen share).
+  read -rsp "GitHub Personal Access Token (scope: repo): " token
+  echo
   [[ -n "$token" ]] || die "Token required."
 
   read -rp "Target repo (owner/name) [Boa-Thomas/Sistema-FP]: " repo
@@ -100,6 +111,9 @@ cmd_setup() {
   read -rp "Extra labels (comma separated) [self-hosted,linux,x64,wsl2]: " labels
   labels="${labels:-self-hosted,linux,x64,wsl2}"
 
+  # Cria o arquivo JA restrito. Fazer `cat > ...` e so depois `chmod 600` deixa
+  # uma janela em que o PAT esta 644 — legivel por qualquer usuario da maquina.
+  install -m 600 /dev/null "$RM_ENV" || die "Nao consegui criar $RM_ENV"
   cat > "$RM_ENV" <<EOF
 GITHUB_TOKEN=$token
 GITHUB_REPO=$repo
@@ -117,16 +131,17 @@ RUNNER_MEMORY_MAX=4096M
 EOF
   chmod 600 "$RM_ENV"
 
-  set -a; source "$RM_ENV"; set +a
+  load_env || die "Nao consegui reler $RM_ENV"
   log_info "Validating token + repo access..."
   gh_validate_auth
+  warn_if_public_repo
   log_ok "Setup complete. Run: runner-mgr up 4"
 }
 
 cmd_capacity() {
   # Load .env if available so we can show current vs. suggested values.
   if [[ -f "${RM_ENV:-}" ]]; then
-    set -a; source "$RM_ENV" 2>/dev/null || true; set +a
+    load_env 2>/dev/null || true
   fi
 
   local cpus total_mib reserve cap cap_mib usable fit cpu_cap rec
@@ -174,6 +189,7 @@ cmd_capacity() {
 cmd_up() {
   require_env
   gh_validate_auth
+  warn_if_public_repo
 
   # Parse optional --force flag (may appear before or after N).
   local force=0 n=""
@@ -237,6 +253,9 @@ cmd_down() {
     [[ -n "$ids" ]] || { log_info "No runners to remove."; return; }
     for id in $ids; do remove_runner "$id"; done
   else
+    # Valida ANTES do teste `[[ -d ]]`: com o ID cru, `down '1/../../vitima'`
+    # passava no teste e o rm -rf saia de runners/.
+    require_runner_id "$target"
     [[ -d "$(runner_dir "$target")" ]] || die "Unknown runner id: $target"
     remove_runner "$target"
   fi
@@ -248,6 +267,7 @@ cmd_stop() {
   if [[ "$target" == "all" ]]; then
     for id in $(list_local_runners); do stop_runner "$id"; done
   else
+    require_runner_id "$target"
     stop_runner "$target"
   fi
 }
@@ -259,6 +279,7 @@ cmd_start() {
   if [[ "$target" == "all" ]]; then
     for id in $(list_local_runners); do start_runner "$id"; done
   else
+    require_runner_id "$target"
     start_runner "$target"
   fi
 }
@@ -355,6 +376,10 @@ Description=runner-mgr queue monitor — alert on a stuck queue / failing runner
 Type=oneshot
 ExecStart=${self} queue-check
 TimeoutStartSec=180
+# Este servico so faz chamada de API e escreve log/state — nao precisa de mais
+# nada. (O watchdog nao leva o mesmo tratamento: ele sobe os runners.)
+NoNewPrivileges=true
+PrivateTmp=true
 EOF
   cat > "$unit_dir/runner-mgr-queue.timer" <<EOF
 [Unit]
@@ -391,7 +416,8 @@ cmd_uninstall_queue_monitor() {
 
 cmd_list() {
   require_env
-  gh_list_runners | jq -r '
+  local json; json=$(gh_list_runners) || die "list: nao consegui consultar a API do GitHub"
+  printf '%s' "$json" | jq -r '
     ["ID","NAME","STATUS","BUSY","LABELS"],
     (.[] | [
       .id,
@@ -406,6 +432,8 @@ cmd_list() {
 cmd_logs() {
   local id="${1:-}" follow="${2:-}"
   [[ -n "$id" ]] || die "logs: usage — runner-mgr logs <id> [-f]"
+  # Sem isto, `logs '../../../../var/log/algum'` saia de logs/.
+  require_runner_id "$id"
   local log; log=$(runner_log "$id")
   [[ -f "$log" ]] || die "No log file for runner-$id"
   if [[ "$follow" == "-f" ]]; then
@@ -418,36 +446,56 @@ cmd_logs() {
 cmd_clean() {
   require_env
   log_info "Removing offline runners from GitHub..."
-  local count=0
-  while IFS=$'\t' read -r id name status; do
+  local count=0 listing
+  listing=$(gh_list_runners) \
+    || die "clean: nao consegui listar os runners no GitHub — abortando (nada foi apagado)."
+
+  while IFS=$'\t' read -r gid name status; do
     [[ "$status" == "offline" ]] || continue
-    log_info "Deleting offline: $name (id=$id)"
-    gh_delete_runner "$id"
-    count=$((count+1))
-  done < <(gh_list_runners | jq -r '.[] | [.id, .name, .status] | @tsv')
+    log_info "Deleting offline: $name (id=$gid)"
+    if gh_delete_runner "$gid"; then count=$((count+1)); fi
+  done < <(printf '%s' "$listing" | jq -r '.[] | [.id, .name, .status] | @tsv')
 
   log_info "Cleaning up local runner dirs without process or registration..."
+  local id
   for id in $(list_local_runners); do
-    if ! runner_is_running "$id"; then
-      local name; name=$(runner_state_get "$id" "name") || true
-      # ATENCAO — caminho destrutivo decidido por resposta de API.
-      # `gh_runner_id_by_name` devolve vazio tanto para "nao existe no GitHub"
-      # quanto para "a chamada falhou" (rate limit, 403, rede): `gh_curl` nao
-      # checa status HTTP, entao um body de erro vira `[]` no jq. Sem a
-      # confirmacao abaixo, um runner registrado-e-parado seria tratado como
-      # orfao e teria o diretorio apagado, deixando a registracao pendurada.
-      # So apaga se a API respondeu E respondeu que nao conhece este runner.
-      local gh_ok=0
-      gh_list_runners >/dev/null 2>&1 && gh_ok=1
-      if [[ -n "$name" ]] && (( gh_ok )) && [[ -z "$(gh_runner_id_by_name "$name")" ]]; then
-        log_info "Removing orphan local runner-$id"
-        local dir; dir="$(runner_dir "$id")"
-        rm -rf "${dir:?diretorio do runner vazio — abortando}"
-        rm -f "$(runner_state_file "$id")" "$(runner_pidfile "$id")"
-        count=$((count+1))
-      fi
+    if runner_is_running "$id"; then continue; fi
+
+    local name; name=$(runner_state_get "$id" "name") || true
+    [[ -n "$name" ]] || continue
+
+    # ATENCAO — caminho destrutivo decidido por resposta de API.
+    #
+    # A versao antiga nao conseguia distinguir "o GitHub nao conhece este
+    # runner" de "a chamada falhou": `gh_curl` nao checava status HTTP, entao um
+    # body de erro (rate limit, 403, rede) virava `[]` no jq e o runner
+    # registrado-e-parado era tratado como orfao — diretorio apagado, registro
+    # pendurado. Precisou de uma confirmacao dupla so para contornar isso.
+    # Agora `gh_runner_id_by_name` devolve != 0 quando a chamada nao deu certo,
+    # e a distincao e explicita.
+    local gh_id
+    if ! gh_id=$(gh_runner_id_by_name "$name"); then
+      log_warn "runner-$id: API do GitHub indisponivel — mantendo o diretorio por seguranca."
+      continue
     fi
+    [[ -z "$gh_id" ]] || continue
+
+    log_info "Removing orphan local runner-$id"
+    safe_rm_runner_dir "$(runner_dir "$id")"
+    rm -f "$(runner_state_file "$id")" "$(runner_pidfile "$id")"
+    count=$((count+1))
   done
+
+  # Diretorio fora do padrao em runners/ nunca vira ID (list_local_runners
+  # filtra), mas merece ser dito em voz alta: um job de CI tem escrita ali, e
+  # nome com metacaractere de shell era exatamente o vetor de RCE no watchdog.
+  local bogus; bogus="$(list_bogus_runner_dirs)"
+  if [[ -n "$bogus" ]]; then
+    log_warn "Diretorios em ${RM_RUNNERS} fora do padrao runner-<numero> (ignorados, nao apagados):"
+    printf '%s\n' "$bogus" | sed 's/^/    /' >&2
+    log_warn "Se voce nao criou esses, trate como indicio de comprometimento — veja SECURITY.md."
+  fi
+
   log_ok "Cleaned $count entries"
 }
 

@@ -34,12 +34,130 @@ log_dim()   { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
 
 die() { log_error "$*"; exit 1; }
 
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+# Chaves aceitas no .env. Tudo fora desta lista e ignorado com aviso.
+RM_ENV_KEYS=(
+  GITHUB_TOKEN GITHUB_REPO
+  RUNNER_LABELS RUNNER_WORKDIR RUNNER_GROUP
+  RUNNER_EPHEMERAL RUNNER_WIPE_WORK RUNNER_SKIP_CHECKSUM
+  MAX_RUNNERS RUNNER_MEMORY_MAX MEM_OS_RESERVE_MIB
+  WATCHDOG_CHURN_WINDOW
+  NTFY_TOPIC NTFY_SERVER NTFY_TOKEN QMON_STUCK_SECS
+)
+
+# Formato exigido por chave, para as que sao avaliadas em contexto aritmetico
+# ou viram argumento de systemd. Vazio = texto livre.
+#
+# Isto NAO e refinamento do parser: e o que fecha a porta que ele deixou aberta.
+# `(( ))` do bash faz expansao RECURSIVA — avaliar uma variavel cujo valor e
+# `PIPESTATUS[$(comando)]` EXECUTA o comando. memory_budget_check avalia
+# MEM_OS_RESERVE_MIB e MAX_RUNNERS exatamente assim. Parar o `source` sem parar
+# isto teria deixado a persistencia via .env de pe, so por outro caminho.
+env_key_pattern() {
+  case "$1" in
+    MAX_RUNNERS|MEM_OS_RESERVE_MIB|QMON_STUCK_SECS|WATCHDOG_CHURN_WINDOW)
+      printf '%s' '^[0-9]+$' ;;
+    RUNNER_EPHEMERAL|RUNNER_WIPE_WORK|RUNNER_SKIP_CHECKSUM)
+      printf '%s' '^[01]$' ;;
+    RUNNER_MEMORY_MAX)
+      printf '%s' '^[0-9]+(\.[0-9]+)?[KMGTkmgt]?[IiBb]{0,2}$' ;;
+    *) printf '%s' '' ;;
+  esac
+}
+
+# Garante que uma variavel usada em contexto aritmetico contem so digitos.
+# Cobre o valor HERDADO DO AMBIENTE — o que vem do .env ja passou por load_env,
+# mas estas variaveis tambem podem chegar pelo environment do processo.
+sanitize_int() {
+  local name="$1" default="$2" cur
+  cur="${!name:-}"
+  if [[ ! "$cur" =~ ^[0-9]+$ ]]; then
+    [[ -z "$cur" ]] || log_warn "${name}='${cur}' nao e inteiro — usando ${default}"
+    printf -v "$name" '%s' "$default"
+  fi
+  export "${name?}"
+}
+
+env_key_allowed() {
+  local k="$1" allowed
+  for allowed in "${RM_ENV_KEYS[@]}"; do
+    [[ "$k" == "$allowed" ]] && return 0
+  done
+  return 1
+}
+
+# Le o .env como DADOS, nunca como codigo.
+#
+# A versao antiga fazia `set -a; source "$RM_ENV"; set +a`. `source` EXECUTA o
+# arquivo: um `$(...)` em qualquer valor roda com os nossos privilegios — no
+# watchdog, a cada boot. E o .env e gravavel por qualquer job de CI, porque o
+# job roda com o mesmo usuario que o gerenciador (veja SECURITY.md). Era o vetor
+# de persistencia mais barato do repositorio. Aqui so entram linhas
+# CHAVE=VALOR com chave conhecida, e o valor nunca passa por expansao.
+load_env() {
+  [[ -f "$RM_ENV" ]] || return 1
+  local line key val envname
+  envname="$(basename "$RM_ENV")"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line#"${line%%[![:space:]]*}"}"          # ltrim
+    [[ -z "$line" || "$line" == '#'* ]] && continue
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key%"${key##*[![:space:]]}"}"             # rtrim da chave
+    val="${val#"${val%%[![:space:]]*}"}"             # ltrim do valor
+    val="${val%"${val##*[![:space:]]}"}"             # rtrim do valor
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if ! env_key_allowed "$key"; then
+      log_warn "${envname}: chave desconhecida ignorada: ${key}"
+      continue
+    fi
+    # Aspas em volta do valor sao delimitador, nao conteudo.
+    if [[ ${#val} -ge 2 && "$val" == '"'*'"' ]]; then
+      val="${val:1:${#val}-2}"
+    elif [[ ${#val} -ge 2 && "$val" == "'"*"'" ]]; then
+      val="${val:1:${#val}-2}"
+    fi
+    local pat; pat="$(env_key_pattern "$key")"
+    if [[ -n "$pat" && -n "$val" ]] && ! [[ "$val" =~ $pat ]]; then
+      log_warn "${envname}: ${key}='${val}' fora do formato esperado — ignorado"
+      continue
+    fi
+    printf -v "$key" '%s' "$val"
+    export "${key?}"
+  done < "$RM_ENV"
+  return 0
+}
+
 require_env() {
   [[ -f "$RM_ENV" ]] || die "Config not found at $RM_ENV — run: runner-mgr setup"
-  # shellcheck disable=SC1090
-  set -a; source "$RM_ENV"; set +a
+
+  local mode
+  mode=$(stat -c '%a' "$RM_ENV" 2>/dev/null || echo "")
+  case "$mode" in
+    600|400) ;;
+    *) log_warn "$RM_ENV com permissao ${mode:-?} — o PAT esta legivel por outros. Corrija: chmod 600 $RM_ENV" ;;
+  esac
+
+  load_env || die "Falha ao ler $RM_ENV"
   [[ -n "${GITHUB_TOKEN:-}" ]] || die "GITHUB_TOKEN is empty in $RM_ENV"
   [[ -n "${GITHUB_REPO:-}" ]]  || die "GITHUB_REPO is empty in $RM_ENV"
+
+  # O token vai para um arquivo de config do curl entre aspas duplas (para ficar
+  # fora do argv — veja gh_auth_config). Um `"` ou `\` ali quebraria o parser do
+  # curl e poderia injetar outra opcao. Nenhum formato de PAT do GitHub usa
+  # esses caracteres, entao recusar e barato.
+  [[ "$GITHUB_TOKEN" =~ ^[A-Za-z0-9_.~-]+$ ]] \
+    || die "GITHUB_TOKEN contem caracteres inesperados — verifique $RM_ENV"
+  # Interpolado direto em caminhos de URL da API.
+  [[ "$GITHUB_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] \
+    || die "GITHUB_REPO invalido: '$GITHUB_REPO' (esperado: owner/repo)"
+  # Vira componente de caminho dentro do diretorio do runner.
+  [[ "${RUNNER_WORKDIR:-_work}" =~ ^[A-Za-z0-9._-]+$ ]] \
+    || die "RUNNER_WORKDIR invalido: '${RUNNER_WORKDIR}'"
 }
 
 require_cmd() {
@@ -47,6 +165,84 @@ require_cmd() {
     command -v "$cmd" >/dev/null 2>&1 || die "Missing dependency: $cmd"
   done
 }
+
+# ---------------------------------------------------------------------------
+# Validacao de identificadores e caminhos
+# ---------------------------------------------------------------------------
+
+# Ponto unico de validacao do ID de runner. Tudo abaixo confia nele: caminhos,
+# `rm -rf`, e a invocacao do run.sh.
+#
+# O ID chega de duas fontes e as DUAS eram atacaveis:
+#   1. argv (`runner-mgr start <id>`) — nao havia validacao nenhuma;
+#   2. `list_local_runners`, que deriva o ID do NOME DO DIRETORIO em runners/ —
+#      e um job de CI tem escrita ali (o workdir dele e runners/runner-N/_work).
+# Um diretorio chamado `runner-9';comando;#` fazia o watchdog executar `comando`
+# a cada 15s, como servico systemd, sobrevivendo a reboot.
+# Valida in-place e aborta. NAO ecoa o ID de volta, de proposito: uma versao que
+# devolvesse o valor seria chamada como `id="$(require_runner_id "$1")"`, e ai o
+# `die` rodaria dentro da substituicao — `exit` mataria so aquele subshell, e o
+# fluxo seguiria com o ID vazio. Dois caminhos reais deixam isso passar batido:
+#   - `local id="$(...)"`  — o status vira o do `local`, nunca o da substituicao
+#     (SC2155), entao o errexit nem chega a ver a falha;
+#   - `x="$(...)"` simples dentro de `( ... ) || fallback` — o bash suspende o
+#     errexit inclusive dentro do subshell, e o watchdog usa exatamente essa
+#     forma (`( start_runner "$id" ) || ok=0`).
+# Como statement simples, o die encerra de verdade nos dois casos.
+require_runner_id() {
+  [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] \
+    || die "ID de runner invalido: '${1:-}' (esperado: numero inteiro >= 1)"
+}
+
+# Recusa qualquer caminho que nao resolva para dentro de runners/.
+# `require_runner_id` ja barra `../`; isto e a segunda tranca, aplicada imediatamente
+# antes de cada acao destrutiva — inclusive contra symlink apontando para fora.
+assert_within_runners() {
+  local path="$1" base resolved
+  base="$(realpath -m "$RM_RUNNERS")"
+  resolved="$(realpath -m "$path")"
+  [[ "$resolved" == "$base"/* ]] \
+    || die "recusando operar fora de ${RM_RUNNERS}: ${path}"
+}
+
+# `rm -rf` de um diretorio de runner, com o alvo reconferido na hora.
+#
+# O guard `${dir:?}` fechava a variante "variavel vazia", mas nao a travessia:
+# `runner-mgr down '1/../../vitima'` passava no teste `[[ -d ]]` e apagava o
+# alvo. Agora o caminho resolvido precisa cair sob runners/ e ter o prefixo
+# runner-.
+safe_rm_runner_dir() {
+  local dir="$1" base resolved
+  base="$(realpath -m "$RM_RUNNERS")"
+  resolved="$(realpath -m "$dir")"
+  [[ "$resolved" == "$base"/runner-* ]] \
+    || die "recusando rm -rf fora de ${RM_RUNNERS}: ${dir}"
+  rm -rf "${resolved:?caminho do runner vazio — abortando}"
+}
+
+# Diretorio de trabalho com permissao restrita.
+#
+# Log de runner carrega saida de job, que eventualmente carrega segredo vazado
+# por um workflow. Os arquivos nascem com o umask do processo (tipicamente 644);
+# o diretorio 700 protege de outros usuarios de qualquer jeito.
+ensure_private_dir() {
+  local d
+  for d in "$@"; do
+    mkdir -p "$d"
+    chmod 700 "$d" 2>/dev/null || true
+  done
+}
+
+verify_sha256() {
+  local file="$1" expected="$2" actual
+  [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || return 1
+  actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}') || return 1
+  [[ "$actual" == "$expected" ]]
+}
+
+# ---------------------------------------------------------------------------
+# systemd
+# ---------------------------------------------------------------------------
 
 # Returns 0 when systemd-run --user --scope with memory limits is usable:
 # requires the binary, systemd as PID 1, and cgroup v2 memory controller.
@@ -77,8 +273,13 @@ scope_teardown() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Memoria
+# ---------------------------------------------------------------------------
+
 # RAM to reserve for the OS + runner agents when sizing the memory budget.
-MEM_OS_RESERVE_MIB="${MEM_OS_RESERVE_MIB:-2048}"
+# Via sanitize_int porque memory_budget_check avalia este valor em `(( ))`.
+sanitize_int MEM_OS_RESERVE_MIB 2048
 
 # Parse a memory size (e.g. "4096M", "3.5G", "512", "8GB") to integer MiB.
 # Bare numbers are treated as MiB (matches systemd's default-ish usage here).
@@ -113,6 +314,10 @@ memory_budget_check() {
   (( MB_NEED <= total_mib ))
 }
 
+# ---------------------------------------------------------------------------
+# Estado por runner
+# ---------------------------------------------------------------------------
+
 # State file per runner — JSON-ish key=value, one per line.
 runner_state_file() { echo "$RM_STATE/runner-$1.state"; }
 runner_dir()        { echo "$RM_RUNNERS/runner-$1"; }
@@ -135,11 +340,14 @@ runner_state_get() {
 # today via `labels` (comes from RUNNER_LABELS in .env — user-controlled). The
 # same bug bit qmon_state_set for real, where the stuck-queue signature has
 # literal `|` in it. No delimiter here means no value can break it.
+#
+# O temporario vem de `mktemp` (nasce 600 e com nome imprevisivel) em vez de
+# `${file}.tmp.$$`, que era adivinhavel.
 runner_state_set() {
-  local id="$1" key="$2" value="$3" file
+  local id="$1" key="$2" value="$3" file tmp
   file="$(runner_state_file "$id")"
-  mkdir -p "$(dirname "$file")"
-  local tmp="${file}.tmp.$$"
+  ensure_private_dir "$(dirname "$file")"
+  tmp="$(mktemp "${file}.XXXXXX")" || die "mktemp falhou em $(dirname "$file")"
   {
     [[ -f "$file" ]] && grep -vE "^${key}=" "$file" || true
     echo "${key}=${value}"
@@ -148,11 +356,22 @@ runner_state_set() {
 }
 
 # List all local runner IDs (numeric, sorted).
+#
+# O filtro numerico nao e cosmetico: o nome do diretorio vira ID, e o ID vira
+# caminho e argumento de comando. Qualquer coisa que nao seja `runner-<digitos>`
+# e descartada aqui e reportada por `list_bogus_runner_dirs`.
 list_local_runners() {
   [[ -d "$RM_RUNNERS" ]] || return 0
   find "$RM_RUNNERS" -maxdepth 1 -type d -name 'runner-*' -printf '%f\n' \
-    | sed 's/^runner-//' | sort -n
+    | sed 's/^runner-//' \
+    | { grep -xE '[1-9][0-9]*' || true; } \
+    | sort -n
 }
+# O `|| true` no grep nao e cosmetico: sem ele, runners/ sem nenhum diretorio
+# valido faz o grep sair 1, e com `set -o pipefail` isso vira falha da funcao —
+# derrubando `current=$(list_local_runners | wc -l)` em cmd_up e a contagem
+# inicial do watchdog em vez de devolver zero. Acontece depois de remover o
+# ultimo runner.
 
 # Returns the next available runner ID (1, 2, 3, ...).
 next_runner_id() {
@@ -162,13 +381,57 @@ next_runner_id() {
   echo $((max + 1))
 }
 
+# Diretorios sob runners/ que NAO seguem `runner-<digitos>`. Ou e sobra de uma
+# remocao incompleta, ou e tentativa de contrabandear metacaractere de shell
+# atraves do ID. Nunca usados; so reportados.
+list_bogus_runner_dirs() {
+  [[ -d "$RM_RUNNERS" ]] || return 0
+  find "$RM_RUNNERS" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' \
+    | grep -vxE 'runner-[1-9][0-9]*' || true
+}
+
 # Check if a runner process is alive via its PID file.
 runner_is_running() {
   local id="$1" pidfile pid
   pidfile="$(runner_pidfile "$id")"
   [[ -f "$pidfile" ]] || return 1
   pid=$(cat "$pidfile" 2>/dev/null || echo "")
-  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  pid_is_zombie "$pid" && return 1
+  runner_pid_matches "$id" "$pid"
+}
+
+# Um zumbi ja morreu — so falta o pai colher. `kill -0` continua respondendo
+# com sucesso, entao sem esta checagem um runner encerrado contaria como vivo
+# em host cujo PID 1 nao reapa prontamente (comum em container). O check de cwd
+# abaixo pega o caso por acidente (zumbi nao tem /proc/PID/cwd), mas so quando
+# /proc e introspetavel — se nao for, runner_pid_matches confia no PID e o
+# zumbi passaria.
+pid_is_zombie() {
+  local st
+  st=$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $1}') || return 1
+  [[ "$st" == "Z" ]]
+}
+
+# Confirma que o PID ainda e o NOSSO runner.
+#
+# `kill -0` sozinho so diz "existe um processo com este numero". Depois de um
+# reboot ou de reciclagem de PID o pidfile pode apontar para um processo alheio
+# — e `stop_runner` manda SIGTERM e depois SIGKILL para o GRUPO INTEIRO desse
+# PID. O cwd do processo e o diretorio do runner nos dois caminhos de start (o
+# subshell faz `cd "$dir"` antes do exec), entao serve de identidade.
+#
+# Se /proc nao for introspetavel neste host, volta a confiar no PID — nao fica
+# pior que antes.
+runner_pid_matches() {
+  local id="$1" pid="$2" dir cwd
+  [[ -e "/proc/$$/cwd" ]] || return 0
+  dir=$(readlink -f "$(runner_dir "$id")" 2>/dev/null) || return 1
+  [[ -n "$dir" ]] || return 1
+  cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null) || return 1
+  [[ -n "$cwd" ]] || return 1
+  [[ "$cwd" == "$dir" || "$cwd" == "$dir"/* ]]
 }
 
 # Human-readable elapsed time from epoch.
