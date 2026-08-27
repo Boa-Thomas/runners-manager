@@ -23,7 +23,8 @@ watchdog_log_file() { echo "$RM_LOGS/watchdog.log"; }
 # A runner that dies less than this many seconds after being (re)started is
 # treated as churning and earns backoff; one that ran longer is a fresh incident
 # and is restarted immediately.
-WATCHDOG_CHURN_WINDOW="${WATCHDOG_CHURN_WINDOW:-180}"
+# Via sanitize_int: avaliado em `(( ... < WATCHDOG_CHURN_WINDOW ))`.
+sanitize_int WATCHDOG_CHURN_WINDOW 180
 
 # Supervise loop. Arg: poll interval in seconds (default 15).
 watchdog_loop() {

@@ -48,6 +48,39 @@ RM_ENV_KEYS=(
   NTFY_TOPIC NTFY_SERVER NTFY_TOKEN QMON_STUCK_SECS
 )
 
+# Formato exigido por chave, para as que sao avaliadas em contexto aritmetico
+# ou viram argumento de systemd. Vazio = texto livre.
+#
+# Isto NAO e refinamento do parser: e o que fecha a porta que ele deixou aberta.
+# `(( ))` do bash faz expansao RECURSIVA — avaliar uma variavel cujo valor e
+# `PIPESTATUS[$(comando)]` EXECUTA o comando. memory_budget_check avalia
+# MEM_OS_RESERVE_MIB e MAX_RUNNERS exatamente assim. Parar o `source` sem parar
+# isto teria deixado a persistencia via .env de pe, so por outro caminho.
+env_key_pattern() {
+  case "$1" in
+    MAX_RUNNERS|MEM_OS_RESERVE_MIB|QMON_STUCK_SECS|WATCHDOG_CHURN_WINDOW)
+      printf '%s' '^[0-9]+$' ;;
+    RUNNER_EPHEMERAL|RUNNER_WIPE_WORK|RUNNER_SKIP_CHECKSUM)
+      printf '%s' '^[01]$' ;;
+    RUNNER_MEMORY_MAX)
+      printf '%s' '^[0-9]+(\.[0-9]+)?[KMGTkmgt]?[IiBb]{0,2}$' ;;
+    *) printf '%s' '' ;;
+  esac
+}
+
+# Garante que uma variavel usada em contexto aritmetico contem so digitos.
+# Cobre o valor HERDADO DO AMBIENTE — o que vem do .env ja passou por load_env,
+# mas estas variaveis tambem podem chegar pelo environment do processo.
+sanitize_int() {
+  local name="$1" default="$2" cur
+  cur="${!name:-}"
+  if [[ ! "$cur" =~ ^[0-9]+$ ]]; then
+    [[ -z "$cur" ]] || log_warn "${name}='${cur}' nao e inteiro — usando ${default}"
+    printf -v "$name" '%s' "$default"
+  fi
+  export "${name?}"
+}
+
 env_key_allowed() {
   local k="$1" allowed
   for allowed in "${RM_ENV_KEYS[@]}"; do
@@ -87,6 +120,11 @@ load_env() {
       val="${val:1:${#val}-2}"
     elif [[ ${#val} -ge 2 && "$val" == "'"*"'" ]]; then
       val="${val:1:${#val}-2}"
+    fi
+    local pat; pat="$(env_key_pattern "$key")"
+    if [[ -n "$pat" && -n "$val" ]] && ! [[ "$val" =~ $pat ]]; then
+      log_warn "${envname}: ${key}='${val}' fora do formato esperado — ignorado"
+      continue
     fi
     printf -v "$key" '%s' "$val"
     export "${key?}"
@@ -240,7 +278,8 @@ scope_teardown() {
 # ---------------------------------------------------------------------------
 
 # RAM to reserve for the OS + runner agents when sizing the memory budget.
-MEM_OS_RESERVE_MIB="${MEM_OS_RESERVE_MIB:-2048}"
+# Via sanitize_int porque memory_budget_check avalia este valor em `(( ))`.
+sanitize_int MEM_OS_RESERVE_MIB 2048
 
 # Parse a memory size (e.g. "4096M", "3.5G", "512", "8GB") to integer MiB.
 # Bare numbers are treated as MiB (matches systemd's default-ish usage here).
@@ -325,8 +364,21 @@ list_local_runners() {
   [[ -d "$RM_RUNNERS" ]] || return 0
   find "$RM_RUNNERS" -maxdepth 1 -type d -name 'runner-*' -printf '%f\n' \
     | sed 's/^runner-//' \
-    | grep -xE '[1-9][0-9]*' \
+    | { grep -xE '[1-9][0-9]*' || true; } \
     | sort -n
+}
+# O `|| true` no grep nao e cosmetico: sem ele, runners/ sem nenhum diretorio
+# valido faz o grep sair 1, e com `set -o pipefail` isso vira falha da funcao —
+# derrubando `current=$(list_local_runners | wc -l)` em cmd_up e a contagem
+# inicial do watchdog em vez de devolver zero. Acontece depois de remover o
+# ultimo runner.
+
+# Returns the next available runner ID (1, 2, 3, ...).
+next_runner_id() {
+  local used max=0 id
+  used=$(list_local_runners)
+  for id in $used; do (( id > max )) && max=$id; done
+  echo $((max + 1))
 }
 
 # Diretorios sob runners/ que NAO seguem `runner-<digitos>`. Ou e sobra de uma
@@ -346,7 +398,20 @@ runner_is_running() {
   pid=$(cat "$pidfile" 2>/dev/null || echo "")
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
+  pid_is_zombie "$pid" && return 1
   runner_pid_matches "$id" "$pid"
+}
+
+# Um zumbi ja morreu — so falta o pai colher. `kill -0` continua respondendo
+# com sucesso, entao sem esta checagem um runner encerrado contaria como vivo
+# em host cujo PID 1 nao reapa prontamente (comum em container). O check de cwd
+# abaixo pega o caso por acidente (zumbi nao tem /proc/PID/cwd), mas so quando
+# /proc e introspetavel — se nao for, runner_pid_matches confia no PID e o
+# zumbi passaria.
+pid_is_zombie() {
+  local st
+  st=$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $1}') || return 1
+  [[ "$st" == "Z" ]]
 }
 
 # Confirma que o PID ainda e o NOSSO runner.

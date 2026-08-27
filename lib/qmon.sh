@@ -28,7 +28,9 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/github.sh"
 
 # How long the queue must stay full (0 idle) before it counts as "stuck".
-QMON_STUCK_SECS="${QMON_STUCK_SECS:-1500}"   # 25 min — under the 30 min cadence
+# Via sanitize_int: e avaliado em `(( queued_for >= QMON_STUCK_SECS ))`, e
+# contexto aritmetico executa comando embutido no valor.
+sanitize_int QMON_STUCK_SECS 1500            # 25 min — under the 30 min cadence
 
 qmon_log_file()   { echo "$RM_LOGS/queue-monitor.log"; }
 qmon_state_file() { echo "$RM_STATE/qmon.state"; }
@@ -135,7 +137,11 @@ qmon_count_runs() {
 }
 
 # Idade em segundos do run mais antigo que AINDA NAO COMECOU — nenhum job dele
-# iniciado. Ecoa 0 quando nao ha nenhum.
+# iniciado. Ecoa 0 quando nao ha nenhum; devolve != 0 quando NAO CONSEGUIU medir.
+#
+# A distincao importa: 0 e um valor semantico valido ("nada esperando"), entao
+# transformar falha de API em 0 fazia o qmon_check concluir "fila saudavel" e
+# ate mandar o ping de recuperacao — com um run possivelmente parado ha horas.
 #
 # Por que nao basta olhar `status=queued`: o GitHub marca o RUN como `queued`
 # enquanto QUALQUER job dele espera slot, mesmo com os outros ja rodando ou
@@ -151,11 +157,11 @@ qmon_oldest_unstarted_age() {
   local runs ids id created t now started
   local body
   body=$(gh_curl GET "/repos/${GITHUB_REPO}/actions/runs?status=queued&per_page=100") \
-    || { echo 0; return; }
+    || return 1
   runs=$(printf '%s' "$body" \
         | jq -r '[(.workflow_runs // [])[] | select(.event != "dynamic")]
-                 | sort_by(.created_at) | .[] | "\(.id) \(.created_at)"' 2>/dev/null) || { echo 0; return; }
-  [[ -z "$runs" ]] && { echo 0; return; }
+                 | sort_by(.created_at) | .[] | "\(.id) \(.created_at)"' 2>/dev/null) || return 1
+  [[ -z "$runs" ]] && { echo 0; return 0; }
   now=$(date +%s)
   while read -r id created; do
     [[ -n "$id" ]] || continue
@@ -247,7 +253,13 @@ qmon_check() {
       "A API do GitHub falhou ao contar os runs enfileirados de ${GITHUB_REPO}." high warning
     return 0
   fi
-  queued_for="$(qmon_oldest_unstarted_age)"
+  if ! queued_for="$(qmon_oldest_unstarted_age)"; then
+    qmon_log "ALERT queue-age-failed — nao consegui medir ha quanto tempo o run mais antigo espera"
+    qmon_maybe_notify "gh-queue-age-fail" "runner-mgr: nao consegui medir a espera da fila" \
+      "A API do GitHub falhou ao listar os runs enfileirados de ${GITHUB_REPO}. Fila com ${queued} run(s), estado real desconhecido." \
+      high warning
+    return 0
+  fi
 
   # --- decide ---
   local -a problems=()

@@ -48,6 +48,17 @@ expect_eq() {
   if [[ "$got" == "$expected" ]]; then ok "$desc"; else bad "$desc — esperado '$expected', veio '$got'"; fi
 }
 
+# `kill -0` responde com sucesso para um zumbi: o processo ja morreu, so falta o
+# pai colher. Em container cujo PID 1 nao reapa prontamente, um `kill -0` puro
+# faz o teste de stop_runner reportar falha apesar do encerramento correto.
+pid_alive() {
+  local p="$1" st
+  kill -0 "$p" 2>/dev/null || return 1
+  st=$(sed 's/^.*) //' "/proc/$p/stat" 2>/dev/null | awk '{print $1}')
+  [[ "$st" == "Z" ]] && return 1
+  return 0
+}
+
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
 mkdir -p "$SANDBOX/runners" "$SANDBOX/state" "$SANDBOX/logs"
@@ -289,7 +300,7 @@ if [[ -n "$LPID" ]] && kill -0 "$LPID" 2>/dev/null; then
     || bad "start_runner duplicou o processo"
   life 'stop_runner 1 >/dev/null 2>&1' >/dev/null
   sleep 0.3
-  kill -0 "$LPID" 2>/dev/null \
+  pid_alive "$LPID" \
     && { bad "stop_runner nao encerrou o processo"; kill -9 "$LPID" 2>/dev/null || true; } \
     || ok "stop_runner encerrou o processo"
   expect_eq "desired_state=stopped persistido (watchdog nao ressuscita)" "stopped" \
@@ -345,6 +356,93 @@ eph 'RUNNER_EPHEMERAL=0; ensure_registered 2' >/dev/null
 grep -q -- '--ephemeral' "$EPH/config-args.txt" 2>/dev/null \
   && bad "RUNNER_EPHEMERAL=0 ainda passou --ephemeral" \
   || ok "RUNNER_EPHEMERAL=0 volta ao runner persistente"
+
+# --------------------------------------------------------------------------
+group "Achados da review do PR #1"
+# --------------------------------------------------------------------------
+# next_runner_id foi perdido ao reescrever common.sh; cmd_up chama e quebrava.
+mkdir -p "$SANDBOX/runners/runner-3" "$SANDBOX/runners/runner-11"
+expect_eq "next_runner_id continua definido e devolve max+1" 12 'next_runner_id'
+mkdir -p "$SANDBOX/runners/runner-99';id;#"
+expect_eq "next_runner_id ignora diretorio fora do padrao" 12 'next_runner_id'
+rm -rf "$SANDBOX/runners/runner-99';id;#"
+
+# Lista vazia: grep sem match + pipefail derrubava o chamador.
+rm -rf "$SANDBOX/runners"; mkdir -p "$SANDBOX/runners"
+expect_ok "runners/ vazio nao derruba o chamador sob set -e + pipefail" \
+  'set -o pipefail; current=$(list_local_runners | wc -l); [[ "$current" == "0" ]]'
+expect_eq "next_runner_id parte de 1 quando nao ha runner" 1 'next_runner_id'
+mkdir -p "$SANDBOX/runners/runner-1"
+
+# Contexto aritmetico executa comando embutido no valor: o parser sozinho nao
+# fechava a persistencia via .env, so trocava o caminho.
+rm -f "$SANDBOX/ARITH_PWN"
+cat > "$SANDBOX/.env" <<EOF
+GITHUB_TOKEN=ghp_ok
+GITHUB_REPO=dono/repo
+MEM_OS_RESERVE_MIB=PIPESTATUS[\$(touch $SANDBOX/ARITH_PWN)]
+EOF
+in_sandbox 'load_env >/dev/null 2>&1; memory_budget_check 4 >/dev/null 2>&1 || true' >/dev/null
+[[ -f "$SANDBOX/ARITH_PWN" ]] \
+  && bad "valor do .env foi EXECUTADO em contexto aritmetico" \
+  || ok "valor nao-numerico e recusado antes de chegar a (( ))"
+expect_eq "MEM_OS_RESERVE_MIB mantem o default apos recusar o valor" 2048 \
+  'load_env >/dev/null 2>&1; printf "%s" "$MEM_OS_RESERVE_MIB"'
+
+cat > "$SANDBOX/.env" <<'EOF'
+GITHUB_TOKEN=ghp_ok
+GITHUB_REPO=dono/repo
+MAX_RUNNERS=4x
+RUNNER_EPHEMERAL=sim
+RUNNER_MEMORY_MAX=4096M
+EOF
+expect_eq "MAX_RUNNERS mal formado e ignorado" "" \
+  'load_env >/dev/null 2>&1; printf "%s" "${MAX_RUNNERS:-}"'
+# Valor recusado cai no default definido ao carregar a lib — que para
+# RUNNER_EPHEMERAL e o seguro (1). Um `.env` com lixo nao consegue desligar o
+# isolamento por acidente nem de proposito.
+expect_eq "RUNNER_EPHEMERAL nao-booleano cai no default seguro" "1" \
+  'load_env >/dev/null 2>&1; printf "%s" "${RUNNER_EPHEMERAL:-}"'
+expect_eq "RUNNER_MEMORY_MAX bem formado passa" "4096M" \
+  'load_env >/dev/null 2>&1; printf "%s" "$RUNNER_MEMORY_MAX"'
+
+# O valor tambem pode vir do ambiente, sem passar por load_env.
+rm -f "$SANDBOX/ARITH_PWN"
+MEM_OS_RESERVE_MIB="PIPESTATUS[\$(touch $SANDBOX/ARITH_PWN)]" RM_ROOT="$SANDBOX" \
+  bash -c "source '$REPO_ROOT/lib/common.sh' 2>/dev/null; memory_budget_check 4" >/dev/null 2>&1 || true
+[[ -f "$SANDBOX/ARITH_PWN" ]] \
+  && bad "valor herdado do ambiente foi executado em (( ))" \
+  || ok "sanitize_int cobre o valor herdado do ambiente"
+
+# Zumbi: kill -0 responde sucesso, mas o processo ja morreu.
+zfile="$SANDBOX/zpid"; rm -f "$zfile"
+bash -c "true & echo \$! > '$zfile'; sleep 3" &
+sleep 0.4
+ZPID="$(cat "$zfile" 2>/dev/null || echo "")"
+if [[ -n "$ZPID" ]] && kill -0 "$ZPID" 2>/dev/null; then
+  expect_ok "pid_is_zombie identifica o zumbi" "pid_is_zombie $ZPID"
+  mkdir -p "$SANDBOX/runners/runner-8"; echo "$ZPID" > "$SANDBOX/state/runner-8.pid"
+  expect_refuse "runner_is_running trata zumbi como encerrado" 'runner_is_running 8'
+  rm -f "$SANDBOX/state/runner-8.pid"
+else
+  ok "ambiente reapa zumbis na hora — caso nao reproduzivel aqui (defesa mantida)"
+fi
+wait 2>/dev/null || true
+
+# Falha ao medir a espera nao pode virar "fila saudavel".
+: > "$SANDBOX/calls"
+printf '{}\n' > "$SANDBOX/body1.json"
+if CALL_COUNT="$SANDBOX/calls" FAKE_DIR="$SANDBOX" FAKE_CODE=500 \
+   PATH="$SANDBOX/bin:$PATH" RM_ROOT="$SANDBOX" bash -c "
+     set -uo pipefail
+     source '$REPO_ROOT/lib/qmon.sh'
+     GITHUB_TOKEN=ghp_x; GITHUB_REPO=dono/repo
+     qmon_oldest_unstarted_age
+   " >/dev/null 2>&1; then
+  bad "qmon_oldest_unstarted_age devolveu 0 numa falha de API (fila pareceria saudavel)"
+else
+  ok "qmon_oldest_unstarted_age propaga a falha em vez de ecoar 0"
+fi
 
 # --------------------------------------------------------------------------
 group "Regressoes — bugs ja corrigidos no passado continuam corrigidos"
