@@ -30,7 +30,7 @@ watchdog_loop() {
   local interval="${1:-15}"
   [[ "$interval" =~ ^[0-9]+$ ]] && (( interval > 0 )) || interval=15
   require_env
-  mkdir -p "$RM_LOGS" "$RM_STATE"
+  ensure_private_dir "$RM_LOGS" "$RM_STATE"
 
   local wlog; wlog="$(watchdog_log_file)"
   # Never let a logging failure (disk full, log removed) take down the
@@ -43,7 +43,7 @@ watchdog_loop() {
 
   # Per-runner supervision state (see logic below).
   local -A last_start streak next_ok skipped
-  local running=1
+  local running=1 bogus_seen="__init__"
   trap 'running=0' INT TERM
 
   wd_log "started (interval=${interval}s churn_window=${WATCHDOG_CHURN_WINDOW}s pid=$$ mem_cap=${RUNNER_MEMORY_MAX:-none})"
@@ -57,8 +57,21 @@ watchdog_loop() {
   fi
 
   while (( running )); do
-    local now id
+    local now id bogus
     now=$(date +%s)
+
+    # Diretorio fora do padrao em runners/ nunca vira ID (list_local_runners
+    # filtra), mas dizer em voz alta importa: um job de CI tem escrita ali, e
+    # nome com metacaractere de shell era o vetor de RCE que passava por aqui.
+    # So registra quando o conjunto muda, para nao poluir o log a cada ciclo.
+    bogus="$(list_bogus_runner_dirs)"
+    if [[ "$bogus" != "$bogus_seen" ]]; then
+      bogus_seen="$bogus"
+      if [[ -n "$bogus" ]]; then
+        wd_log "ALERTA diretorios fora do padrao runner-<numero> em ${RM_RUNNERS}: $(printf '%s' "$bogus" | tr '\n' ' ')"
+        wd_log "ALERTA ignorados. Se voce nao criou esses, veja SECURITY.md."
+      fi
+    fi
     for id in $(list_local_runners); do
       (( running )) || break
 
@@ -83,11 +96,21 @@ watchdog_loop() {
       # Quick death? (died < CHURN_WINDOW after its last (re)start.) This is the
       # real churn signal — start_runner's own 1s liveness check can't tell a
       # job-time OOM from a healthy start, but time-since-last-start can.
-      local prev="${last_start[$id]:-0}" quick=0
-      (( prev > 0 && now - prev < WATCHDOG_CHURN_WINDOW )) && quick=1
+      #
+      # Com RUNNER_EPHEMERAL=1, porem, sair rapido virou o CICLO NORMAL: o
+      # runner atende um job e se desregistra. Um job de 40s marcaria churn, o
+      # backoff subiria ate 300s e a frota ficaria parada com fila cheia — o
+      # oposto do que este loop existe para fazer. Quem TERMINOU um job apaga o
+      # proprio .runner ao se desregistrar; quem morreu (OOM, crash) mantem.
+      # So o segundo caso conta como churn.
+      local prev="${last_start[$id]:-0}" quick=0 finished_job=0
+      [[ -f "$(runner_dir "$id")/.runner" ]] || finished_job=1
+      (( prev > 0 && now - prev < WATCHDOG_CHURN_WINDOW && ! finished_job )) && quick=1
 
       if (( quick )); then
         wd_log "runner-$id DOWN (died <${WATCHDOG_CHURN_WINDOW}s after restart) — restarting"
+      elif (( finished_job )); then
+        wd_log "runner-$id terminou um job (efemero) — re-registrando"
       else
         wd_log "runner-$id DOWN — restarting"
       fi

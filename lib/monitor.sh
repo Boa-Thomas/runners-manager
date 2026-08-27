@@ -11,9 +11,12 @@ process_stats() {
   local pid="$1"
   [[ -n "$pid" ]] || { echo "0.0 0"; return; }
   # Sum CPU% and RSS across the runner's process group / descendants.
+  # Lista separada por virgula em vez de deixar o shell fazer word-splitting de
+  # uma string sem aspas.
   local pids
-  pids=$(pgrep -g "$pid" 2>/dev/null || echo "$pid")
-  ps -o pcpu=,rss= -p $pids 2>/dev/null \
+  pids=$(pgrep -g "$pid" 2>/dev/null | paste -sd, - || true)
+  [[ -n "$pids" ]] || pids="$pid"
+  ps -o pcpu=,rss= -p "$pids" 2>/dev/null \
     | awk '{cpu+=$1; rss+=$2} END {printf "%.1f %d\n", cpu+0, int((rss+0)/1024)}'
 }
 
@@ -21,8 +24,10 @@ process_stats() {
 render_status() {
   require_env
 
-  local gh_json
-  gh_json=$(gh_list_runners 2>/dev/null || echo '[]')
+  # Falha de API nao pode passar por "nenhum runner registrado": a tabela
+  # ficaria toda com "—" e pareceria frota vazia. Marca e diz.
+  local gh_json gh_ok=1
+  gh_json=$(gh_list_runners 2>/dev/null) || { gh_ok=0; gh_json='[]'; }
 
   # Header
   printf '%s\n' "${C_BOLD}Runners Manager — ${GITHUB_REPO}${C_RESET}"
@@ -90,8 +95,19 @@ render_status() {
   total=$(echo "$gh_json" | jq 'length')
   online_count=$(echo "$gh_json" | jq '[.[] | select(.status=="online")] | length')
   busy_count=$(echo "$gh_json" | jq '[.[] | select(.busy==true)] | length')
-  printf '%sGitHub:%s %d total  •  %d online  •  %d busy\n' \
-    "$C_BOLD" "$C_RESET" "$total" "$online_count" "$busy_count"
+  if (( gh_ok )); then
+    printf '%sGitHub:%s %d total  •  %d online  •  %d busy\n' \
+      "$C_BOLD" "$C_RESET" "$total" "$online_count" "$busy_count"
+  else
+    printf '%sGitHub:%s %sindisponivel — a coluna GH STATUS acima nao reflete a realidade%s\n' \
+      "$C_BOLD" "$C_RESET" "$C_RED" "$C_RESET"
+  fi
+
+  local bogus; bogus="$(list_bogus_runner_dirs)"
+  if [[ -n "$bogus" ]]; then
+    printf '%s\n' "${C_YELLOW}[!] diretorios fora do padrao runner-<numero> em ${RM_RUNNERS} (ignorados):${C_RESET}"
+    printf '%s\n' "$bogus" | sed 's/^/      /'
+  fi
 }
 
 # Live dashboard — re-renders every N seconds.

@@ -47,9 +47,9 @@ qmon_state_get() {
 # the old value forever and re-pushed the same ntfy alert every 30 min.
 # No delimiter here means no value can break it.
 qmon_state_set() {
-  local key="$1" val="$2" file; file="$(qmon_state_file)"
-  mkdir -p "$(dirname "$file")"
-  local tmp="${file}.tmp.$$"
+  local key="$1" val="$2" file tmp; file="$(qmon_state_file)"
+  ensure_private_dir "$(dirname "$file")"
+  tmp="$(mktemp "${file}.XXXXXX")" || die "mktemp falhou em $(dirname "$file")"
   {
     [[ -f "$file" ]] && grep -vE "^${key}=" "$file" || true
     echo "${key}=${val}"
@@ -59,18 +59,36 @@ qmon_state_set() {
 
 qmon_log() {
   local line="$1" file; file="$(qmon_log_file)"
-  mkdir -p "$(dirname "$file")"
+  ensure_private_dir "$(dirname "$file")"
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$line" >> "$file"
 }
 
 # Push an ntfy notification. No-op (warns) when NTFY_TOPIC is unset.
+#
+# O NTFY_TOKEN sai por arquivo de config do curl no stdin, nunca no argv, pela
+# mesma razao do PAT do GitHub: /proc/<pid>/cmdline e legivel por qualquer
+# processo do host, e neste host rodam jobs de CI de PRs de fork.
 qmon_notify() {
   local title="$1" body="$2" priority="${3:-high}" tags="${4:-warning}"
   local topic="${NTFY_TOPIC:-}" server="${NTFY_SERVER:-https://ntfy.sh}"
   [[ -n "$topic" ]] || { log_warn "NTFY_TOPIC unset in .env — skipping push (logged only)"; return 0; }
-  local -a auth=()
-  [[ -n "${NTFY_TOKEN:-}" ]] && auth=(-H "Authorization: Bearer ${NTFY_TOKEN}")
-  curl -sS -m 15 "${auth[@]}" \
+
+  # CR/LF em valor de header e injecao de header. Estes valores sao internos
+  # hoje, mas o corpo carrega nome de runner vindo da API — nao custa podar.
+  title="${title//[$'\r\n']/ }"
+  tags="${tags//[$'\r\n']/ }"
+  priority="${priority//[$'\r\n']/ }"
+
+  local cfg=""
+  if [[ -n "${NTFY_TOKEN:-}" ]]; then
+    if [[ "$NTFY_TOKEN" =~ ^[A-Za-z0-9_.~+/=-]+$ ]]; then
+      cfg=$(printf 'header = "Authorization: Bearer %s"\n' "$NTFY_TOKEN")
+    else
+      log_warn "NTFY_TOKEN com caracteres inesperados — enviando sem autenticacao."
+    fi
+  fi
+
+  printf '%s' "$cfg" | curl -sS -m 15 --config - \
     -H "Title: ${title}" \
     -H "Priority: ${priority}" \
     -H "Tags: ${tags}" \
@@ -100,11 +118,20 @@ qmon_maybe_notify() {
 # fila: a fila nunca aparecia vazia, e bastava os 4 runners ficarem ocupados
 # para o alerta de "fila parada" disparar por causa de runs que nao dependem
 # de runner nenhum. So conta o que a nossa capacidade pode de fato consumir.
+# `|| echo 0` era ativamente perigoso aqui: uma falha de API virava "fila
+# vazia", exatamente o estado que silencia o alerta. Agora falha e falha.
 qmon_count_runs() {
-  local status="$1" n
-  n=$(gh_curl GET "/repos/${GITHUB_REPO}/actions/runs?status=${status}&per_page=100" \
-        | jq '[(.workflow_runs // [])[] | select(.event != "dynamic")] | length' 2>/dev/null || echo 0)
-  [[ "$n" =~ ^[0-9]+$ ]] && echo "$n" || echo 0
+  local status="$1" body n
+  body=$(gh_curl GET "/repos/${GITHUB_REPO}/actions/runs?status=${status}&per_page=100") || return 1
+  n=$(printf '%s' "$body" \
+      | jq '[(.workflow_runs // [])[] | select(.event != "dynamic")] | length' 2>/dev/null) || return 1
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  # Teto de 100 por pagina: acima disso a profundidade para de crescer e a fila
+  # parece estavel enquanto acumula. Dizer no log e melhor que truncar calado.
+  if (( n >= 100 )); then
+    qmon_log "NOTE contagem de '${status}' bateu o teto de 100/pagina — profundidade real pode ser maior"
+  fi
+  printf '%s\n' "$n"
 }
 
 # Idade em segundos do run mais antigo que AINDA NAO COMECOU — nenhum job dele
@@ -122,9 +149,12 @@ qmon_count_runs() {
 # iniciado — normalmente 1 ou 2 chamadas extras, nao uma por run.
 qmon_oldest_unstarted_age() {
   local runs ids id created t now started
-  runs=$(gh_curl GET "/repos/${GITHUB_REPO}/actions/runs?status=queued&per_page=100" \
+  local body
+  body=$(gh_curl GET "/repos/${GITHUB_REPO}/actions/runs?status=queued&per_page=100") \
+    || { echo 0; return; }
+  runs=$(printf '%s' "$body" \
         | jq -r '[(.workflow_runs // [])[] | select(.event != "dynamic")]
-                 | sort_by(.created_at) | .[] | "\(.id) \(.created_at)"' 2>/dev/null)
+                 | sort_by(.created_at) | .[] | "\(.id) \(.created_at)"' 2>/dev/null) || { echo 0; return; }
   [[ -z "$runs" ]] && { echo 0; return; }
   now=$(date +%s)
   while read -r id created; do
@@ -168,12 +198,16 @@ qmon_check() {
     [[ "$ds" == "stopped" ]] || expected=$((expected + 1))
   done
 
+  # Alertas indo para servidor publico sem autenticacao: o topico e o unico
+  # segredo, e o corpo carrega nome do repo e dos runners. Quem descobrir o
+  # topico le o status do CI e pode forjar alerta.
+  if [[ "${NTFY_SERVER:-https://ntfy.sh}" == *ntfy.sh* && -z "${NTFY_TOKEN:-}" && -n "${NTFY_TOPIC:-}" ]]; then
+    qmon_log "NOTE alertas vao para servidor publico sem auth — veja SECURITY.md"
+  fi
+
   # --- GitHub reachability / auth ---
   local repo_code
-  repo_code=$(curl -sS -o /dev/null -w '%{http_code}' -m 20 \
-    -H "Authorization: Bearer $GITHUB_TOKEN" \
-    -H "Accept: application/vnd.github+json" \
-    "${GH_API}/repos/${GITHUB_REPO}" 2>/dev/null || echo 000)
+  repo_code=$(gh_http_code "/repos/${GITHUB_REPO}")
   if [[ "$repo_code" != "200" ]]; then
     qmon_log "ALERT github-unreachable http=${repo_code} (PAT expired? network down?)"
     qmon_maybe_notify "gh-${repo_code}" "runner-mgr: sem acesso ao GitHub" \
@@ -184,7 +218,13 @@ qmon_check() {
 
   # --- runner health ---
   local runners_json total online busy offline_names idle
-  runners_json="$(gh_list_runners)"
+  if ! runners_json="$(gh_list_runners)"; then
+    qmon_log "ALERT runner-list-failed — /repos respondeu 200 mas a listagem de runners falhou"
+    qmon_maybe_notify "gh-list-fail" "runner-mgr: nao consegui listar os runners" \
+      "A API respondeu ao /repos de ${GITHUB_REPO} mas falhou ao listar runners. Estado da frota desconhecido." \
+      high warning
+    return 0
+  fi
   total=$(echo   "$runners_json" | jq 'length')
   online=$(echo  "$runners_json" | jq '[.[]|select(.status=="online")]|length')
   busy=$(echo    "$runners_json" | jq '[.[]|select(.busy==true)]|length')
@@ -201,7 +241,12 @@ qmon_check() {
   # Idade do mais antigo distingue os dois casos: fila cheia com runs jovens e
   # saude; run especifico parado ha 25min e problema.
   local queued queued_for
-  queued="$(qmon_count_runs queued)"
+  if ! queued="$(qmon_count_runs queued)"; then
+    qmon_log "ALERT queue-count-failed — nao consegui medir a profundidade da fila"
+    qmon_maybe_notify "gh-queue-fail" "runner-mgr: nao consegui medir a fila" \
+      "A API do GitHub falhou ao contar os runs enfileirados de ${GITHUB_REPO}." high warning
+    return 0
+  fi
   queued_for="$(qmon_oldest_unstarted_age)"
 
   # --- decide ---

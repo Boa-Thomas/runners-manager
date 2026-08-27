@@ -6,20 +6,57 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 # shellcheck disable=SC1091
 source "$(dirname "${BASH_SOURCE[0]}")/github.sh"
 
+# Runner efemero: atende UM job e se desregistra. E a fronteira entre jobs —
+# sem ela, o que um job deixa plantado no runner atende o proximo. Custa uma
+# reconfiguracao por job. Ponha 0 no .env so se souber o que esta abrindo mao.
+RUNNER_EPHEMERAL="${RUNNER_EPHEMERAL:-1}"
+# Limpa o _work entre jobs. `--ephemeral` desregistra mas NAO apaga os arquivos
+# do job anterior. Custa cache local de build; ponha 0 se preferir a velocidade.
+RUNNER_WIPE_WORK="${RUNNER_WIPE_WORK:-1}"
+
 # Download (or reuse cached) runner tarball. Echoes the cached path.
+#
+# O tarball e extraido e tem config.sh/run.sh EXECUTADOS, entao a integridade
+# dele e execucao de codigo. Antes nao havia verificacao nenhuma — e o vetor nem
+# precisava de MITM: cache/ e gravavel pelo mesmo usuario que roda os jobs,
+# entao um job trocava o tarball em cache e o proximo `runner-mgr up` executava
+# o binario do atacante, com a bencao do cache hit. Por isso o SHA256 e
+# conferido TAMBEM quando o arquivo ja esta em cache.
 ensure_runner_tarball() {
   local version="${1:-}"
   if [[ -z "$version" ]]; then
-    version=$(gh_latest_runner_version)
+    version=$(gh_latest_runner_version) \
+      || die "Nao foi possivel descobrir a ultima versao do runner"
   fi
+  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+    || die "Versao invalida: '${version}' (esperado: X.Y.Z)"
+
   local tarball="$RM_CACHE/actions-runner-linux-x64-${version}.tar.gz"
   local url="https://github.com/actions/runner/releases/download/v${version}/actions-runner-linux-x64-${version}.tar.gz"
 
+  local expected=""
+  if [[ "${RUNNER_SKIP_CHECKSUM:-0}" == "1" ]]; then
+    log_warn "RUNNER_SKIP_CHECKSUM=1 — pulando a verificacao de integridade do tarball." >&2
+  else
+    expected=$(gh_runner_sha256 "$version") || expected=""
+    [[ -n "$expected" ]] \
+      || die "Nao foi possivel obter o SHA256 da release v${version}. Recusando executar um tarball nao verificado. Para forcar (nao recomendado): RUNNER_SKIP_CHECKSUM=1"
+  fi
+
+  if [[ -f "$tarball" && -n "$expected" ]] && ! verify_sha256 "$tarball" "$expected"; then
+    log_warn "Tarball em cache com SHA256 divergente — descartando e baixando de novo." >&2
+    rm -f "$tarball"
+  fi
+
   if [[ ! -f "$tarball" ]]; then
     log_info "Downloading runner v${version}..." >&2
-    mkdir -p "$RM_CACHE"
-    curl -fL --progress-bar -o "$tarball.tmp" "$url" \
+    ensure_private_dir "$RM_CACHE"
+    curl -fL --progress-bar -m 900 -o "$tarball.tmp" "$url" \
       || die "Failed to download $url"
+    if [[ -n "$expected" ]] && ! verify_sha256 "$tarball.tmp" "$expected"; then
+      rm -f "$tarball.tmp"
+      die "SHA256 do download nao bate com a release v${version} — abortando."
+    fi
     mv "$tarball.tmp" "$tarball"
     log_ok "Cached: $(basename "$tarball")" >&2
   fi
@@ -28,6 +65,7 @@ ensure_runner_tarball() {
 
 # Extract the tarball into a fresh runner directory.
 install_runner_files() {
+  require_runner_id "$1"
   local id="$1" tarball="$2" dir
   dir="$(runner_dir "$id")"
   [[ -d "$dir" ]] && die "Runner dir already exists: $dir"
@@ -38,30 +76,64 @@ install_runner_files() {
 
 # Register a runner with GitHub.
 configure_runner() {
-  local id="$1" name="runner-$(hostname)-${id}" labels
+  require_runner_id "$1"
+  local id="$1" name labels dir token
+  name="runner-$(hostname)-${id}"
   labels="${RUNNER_LABELS:-self-hosted,linux,x64,wsl2},wsl2-${id}"
-  local dir token
   dir="$(runner_dir "$id")"
   token=$(gh_registration_token)
 
-  log_info "Registering '$name' (labels: $labels)..."
-  (
-    cd "$dir"
-    ./config.sh \
-      --unattended \
-      --url "https://github.com/${GITHUB_REPO}" \
-      --token "$token" \
-      --name "$name" \
-      --labels "$labels" \
-      --work "${RUNNER_WORKDIR:-_work}" \
-      --runnergroup "${RUNNER_GROUP:-default}" \
-      --replace
-  ) >> "$(runner_log "$id")" 2>&1 || die "Configuration failed — see $(runner_log "$id")"
+  local -a args=(
+    --unattended
+    --url "https://github.com/${GITHUB_REPO}"
+    --token "$token"
+    --name "$name"
+    --labels "$labels"
+    --work "${RUNNER_WORKDIR:-_work}"
+    --runnergroup "${RUNNER_GROUP:-default}"
+    --replace
+  )
+  [[ "${RUNNER_EPHEMERAL}" == "1" ]] && args+=(--ephemeral)
+
+  local mode="persistente"
+  [[ "${RUNNER_EPHEMERAL}" == "1" ]] && mode="efemero"
+  log_info "Registering '$name' (${mode}, labels: $labels)..."
+  ( cd "$dir" && ./config.sh "${args[@]}" ) \
+    >> "$(runner_log "$id")" 2>&1 \
+    || die "Configuration failed — see $(runner_log "$id")"
 
   runner_state_set "$id" "name" "$name"
   runner_state_set "$id" "labels" "$labels"
   runner_state_set "$id" "registered_at" "$(date +%s)"
   log_ok "Registered $name"
+}
+
+# Apaga o conteudo do _work sem seguir para fora do diretorio do runner.
+clean_runner_work() {
+  require_runner_id "$1"
+  local id="$1" work
+  work="$(runner_dir "$id")/${RUNNER_WORKDIR:-_work}"
+  [[ -d "$work" ]] || return 0
+  assert_within_runners "$work"
+  find "$work" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+}
+
+# Garante que o runner tem registracao valida antes de subir.
+#
+# Um runner efemero se desregistra ao terminar o job e apaga o proprio .runner.
+# Sem reconfigurar, o run.sh seguinte sobe e morre na hora com "Not configured"
+# — e o watchdog entraria em loop de restart.
+ensure_registered() {
+  require_runner_id "$1"
+  local id="$1" dir
+  dir="$(runner_dir "$id")"
+  [[ -d "$dir" ]] || die "runner-$id nao esta instalado ($dir nao existe)"
+  if [[ -f "$dir/.runner" && -f "$dir/.credentials" ]]; then
+    return 0
+  fi
+  [[ "${RUNNER_WIPE_WORK}" == "1" ]] && clean_runner_work "$id"
+  log_info "runner-$id sem registracao (job efemero consumido) — reconfigurando..."
+  configure_runner "$id"
 }
 
 # Start runner in background. Captures PID + logs.
@@ -70,6 +142,7 @@ configure_runner() {
 # A single overloaded job is then OOM-killed in isolation rather than
 # thrashing every concurrent runner on the host.
 start_runner() {
+  require_runner_id "$1"
   local id="$1" dir log pidfile
   dir="$(runner_dir "$id")"
   log="$(runner_log "$id")"
@@ -80,10 +153,19 @@ start_runner() {
     return 0
   fi
 
-  mkdir -p "$RM_LOGS" "$RM_STATE"
+  ensure_private_dir "$RM_LOGS" "$RM_STATE"
+  ensure_registered "$id"
   log_info "Starting runner-$id..."
   local pid
 
+  # O comando NUNCA e montado como string de shell.
+  #
+  # Antes era `bash -c "cd '$dir' && exec ./run.sh"`, com o caminho interpolado
+  # dentro de aspas simples. Como o $dir carrega o ID e o ID vinha do nome do
+  # diretorio, uma aspa simples no nome fechava o literal e o resto virava
+  # comando — executado pelo watchdog a cada 15s. `require_runner_id` ja barra
+  # isso na entrada; aqui o subshell faz o `cd` de verdade, entao nao ha string
+  # para escapar de jeito nenhum.
   if [[ -n "${RUNNER_MEMORY_MAX:-}" ]] && systemd_run_available; then
     local unit="runner-mgr-${id}"
     # Clear any stale scope left by a previous crash (OOM-killed scopes land in
@@ -97,16 +179,22 @@ start_runner() {
     # state (e.g. OOM-kill), so it never lingers to block the next start.
     # systemd-run stays alive as the scope controller until run.sh exits, so
     # the captured $! PID remains a valid liveness proxy for runner_is_running.
-    systemd-run --user --scope --quiet --collect --unit="$unit" \
-      -p MemoryMax="${RUNNER_MEMORY_MAX}" -p MemorySwapMax=0 \
-      setsid bash -c "cd '$dir' && exec ./run.sh" >> "$log" 2>&1 < /dev/null &
+    (
+      cd "$dir" || exit 1
+      exec systemd-run --user --scope --quiet --collect --unit="$unit" \
+        -p MemoryMax="${RUNNER_MEMORY_MAX}" -p MemorySwapMax=0 \
+        setsid ./run.sh
+    ) >> "$log" 2>&1 < /dev/null &
     pid=$!
     runner_state_set "$id" "scope_unit" "${unit}.scope"
     log_info "Memory cap: ${RUNNER_MEMORY_MAX} (scope: ${unit}.scope)"
   else
     # Fallback: no cgroup memory cap. Use setsid so the process survives
     # parent shell exit.
-    setsid bash -c "cd '$dir' && exec ./run.sh" >> "$log" 2>&1 < /dev/null &
+    (
+      cd "$dir" || exit 1
+      exec setsid ./run.sh
+    ) >> "$log" 2>&1 < /dev/null &
     pid=$!
   fi
 
@@ -126,6 +214,7 @@ start_runner() {
 
 # Gracefully stop a runner process.
 stop_runner() {
+  require_runner_id "$1"
   local id="$1" pidfile pid
   pidfile="$(runner_pidfile "$id")"
   # Record intent BEFORE the early-return path so the watchdog won't resurrect a
@@ -150,6 +239,9 @@ stop_runner() {
   fi
 
   # SIGTERM to the process group — run.sh spawns Runner.Listener as a child.
+  # runner_is_running ja confirmou, via cwd em /proc, que este PID e o nosso
+  # runner e nao um numero reciclado por outro processo. Sem isso o `-$pid`
+  # abaixo derrubaria o grupo inteiro de um processo alheio.
   kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
   for _ in {1..15}; do
     kill -0 "$pid" 2>/dev/null || break
@@ -165,6 +257,7 @@ stop_runner() {
 
 # Unregister runner from GitHub and delete local files.
 remove_runner() {
+  require_runner_id "$1"
   local id="$1" dir name gh_id
   dir="$(runner_dir "$id")"
   name=$(runner_state_get "$id" "name")
@@ -182,23 +275,29 @@ remove_runner() {
   fi
 
   if [[ -n "$name" ]]; then
-    gh_id=$(gh_runner_id_by_name "$name" || true)
-    if [[ -n "$gh_id" ]]; then
-      log_info "Force-deleting GitHub runner $name (id=$gh_id)..."
-      gh_delete_runner "$gh_id"
+    if gh_id=$(gh_runner_id_by_name "$name"); then
+      if [[ -n "$gh_id" ]]; then
+        log_info "Force-deleting GitHub runner $name (id=$gh_id)..."
+        gh_delete_runner "$gh_id" || true
+      fi
+    else
+      # gh_list_runners falhou. Antes isso era indistinguivel de "nao existe" e
+      # o registro ficava pendurado no GitHub sem ninguem saber.
+      log_warn "Nao foi possivel confirmar no GitHub se '$name' ainda esta registrado."
+      log_warn "Se sobrar registro orfao, rode 'runner-mgr clean' quando a API voltar."
     fi
   fi
 
-  # `${dir:?}` — se $dir vier vazio por qualquer motivo, o shell aborta em vez
-  # de expandir para `rm -rf ""`. Custo zero e fecha a variante "variavel vazia
-  # em caminho destrutivo", que ja causou um incidente neste projeto.
-  rm -rf "${dir:?diretorio do runner vazio — abortando}"
+  # Reconfere o alvo imediatamente antes de apagar: o `${dir:?}` de antes so
+  # pegava variavel vazia, nao travessia (`down '1/../../vitima'` passava).
+  safe_rm_runner_dir "$dir"
   rm -f "$(runner_state_file "$id")" "$(runner_pidfile "$id")"
   log_ok "runner-$id removed"
 }
 
 # Provision a new runner end-to-end.
 provision_runner() {
+  require_runner_id "$1"
   local id="$1" version="${2:-}" tarball
   tarball=$(ensure_runner_tarball "$version")
   install_runner_files "$id" "$tarball"
